@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+data/
+test_data/
+node_modules/
+*.csv
+*.jpg
+*.jpeg
+*.png
+.streamlit/secrets.toml
+.env
