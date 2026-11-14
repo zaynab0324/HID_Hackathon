@@ -57,10 +57,12 @@ with enroll_tab:
     st.write("Enrollment uses the **same AWS Face Liveness check as the door**: only a LIVE face "
              f"(≥ {config.ENROLL_LIVE_CONFIDENCE}%) can be stored, and a face that is already enrolled "
              "under another name is refused. A photo, video or mask can never be enrolled.")
-    c1, c2, c3 = st.columns([2, 1, 1])
-    person_input = c1.text_input("Person ID (e.g. Afrah Zainab)")
-    role = c2.selectbox("Role", ["student", "staff"], help="Staff can enter at any time.")
-    status = c3.selectbox("Access status", ["active", "suspended"])
+    person_input = st.text_input("Person ID (e.g. Afrah Zainab)")
+    c2, c3 = st.columns(2)
+    role = c2.radio("Role", ["student", "staff"], horizontal=True,
+                    help="Students follow the campus schedule; staff can enter any time.")
+    status = c3.radio("Access status", ["active", "suspended"], horizontal=True,
+                      help="Suspended people are recognised but always denied.")
     if st.button("Start liveness enrollment", type="primary"):
         pid = face_service.clean_person_id(person_input)
         if not pid:
@@ -79,8 +81,12 @@ with enroll_tab:
     st.subheader("Enrolled people")
     people = store.list_persons()
     if people:
-        st.dataframe([{k: p.get(k) for k in ("person_id", "role", "status", "enrolled_via",
-                                             "enroll_liveness")} for p in people], width="stretch")
+        st.dataframe([{"Person": p.get("person_id"), "Role": p.get("role", "student"),
+                       "Status": p.get("status", "active"),
+                       "Enrolled via": p.get("enrolled_via", "-"),
+                       "Enrollment liveness %": p.get("enroll_liveness")} for p in people],
+                     width="stretch")
+        st.caption("Change a person's status (active / suspended) in the Admin tab.")
     else:
         st.info("Nobody enrolled yet.")
     recent = [e for e in store.recent_events(50) if e.get("mode") == "enroll"][:5]

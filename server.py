@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import config
+import evaluate
 import face_service
 import offline
 import official_liveness
@@ -77,7 +78,8 @@ def status():
     threat = security.threat_status()
     return {"online": online, "simulated_offline": offline.is_simulated_offline(),
             "location": config.KIOSK_LOCATION, "pending_sync": len(offline.pending()),
-            "just_synced": synced, "threat": threat, "locations": config.LOCATIONS}
+            "just_synced": synced, "threat": threat, "locations": config.LOCATIONS,
+            "metrics": evaluate.live_kiosk_report(store.recent_events(2000))}
 
 
 @app.post("/api/session")

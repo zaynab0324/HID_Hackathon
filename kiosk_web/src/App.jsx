@@ -84,26 +84,6 @@ function Result({ result, onGuard, onRetry, onNext }) {
         ) : null}
         <button onClick={onNext}>Next person</button>
       </div>
-      <div className="testmode">
-        <label>
-          🧪 Test mode (staff only, for the performance report):{" "}
-          <select value={testLabel} onChange={(e) => setTestLabel(e.target.value)}>
-            <option value="">off (normal use)</option>
-            <option value="genuine">genuine (real enrolled person)</option>
-            <option value="printed_photo">printed photo attack</option>
-            <option value="screen_photo">photo on a phone/screen</option>
-            <option value="video_replay">video replay attack</option>
-            <option value="mask">mask attack</option>
-            <option value="impostor">impostor (real, not enrolled)</option>
-          </select>
-        </label>
-        {credMode && (
-          <div>
-            🔐 Browser credentials:{" "}
-            <b>{credMode === "least-privilege" ? "least-privilege (liveness only, 15 min)" : "development mode (full)"}</b>
-          </div>
-        )}
-      </div>
     </div>
   );
 }
@@ -138,26 +118,6 @@ function OfflinePanel({ status, onResult }) {
       </button>
       {error && <p className="error">{error}</p>}
       <p className="muted">{status?.pending_sync || 0} decision(s) waiting to sync when the connection returns.</p>
-      <div className="testmode">
-        <label>
-          🧪 Test mode (staff only, for the performance report):{" "}
-          <select value={testLabel} onChange={(e) => setTestLabel(e.target.value)}>
-            <option value="">off (normal use)</option>
-            <option value="genuine">genuine (real enrolled person)</option>
-            <option value="printed_photo">printed photo attack</option>
-            <option value="screen_photo">photo on a phone/screen</option>
-            <option value="video_replay">video replay attack</option>
-            <option value="mask">mask attack</option>
-            <option value="impostor">impostor (real, not enrolled)</option>
-          </select>
-        </label>
-        {credMode && (
-          <div>
-            🔐 Browser credentials:{" "}
-            <b>{credMode === "least-privilege" ? "least-privilege (liveness only, 15 min)" : "development mode (full)"}</b>
-          </div>
-        )}
-      </div>
     </div>
   );
 }
@@ -275,6 +235,8 @@ export default function App() {
   };
 
   const offline = status && status.online === false;
+  const m = status?.metrics?.overall;
+  const pct = (v) => (v === null || v === undefined ? "–" : `${v}%`);
 
   return (
     <div className="page">
@@ -372,6 +334,13 @@ export default function App() {
             <option value="impostor">impostor (real, not enrolled)</option>
           </select>
         </label>
+        {m && (
+          <div className="metrics">
+            📊 Live test results ({status.metrics.attempts} labelled attempts) · Liveness detection accuracy <b>{pct(m.liveness_accuracy_pct)}</b> ·
+            Face authentication accuracy <b>{pct(m.face_auth_accuracy_pct)}</b> · FAR <b>{pct(m.false_accept_rate_pct)}</b> ·
+            FRR <b>{pct(m.false_reject_rate_pct)}</b> · Avg decision <b>{m.avg_decision_ms ?? "–"} ms</b>
+          </div>
+        )}
         {credMode && (
           <div>
             🔐 Browser credentials:{" "}
