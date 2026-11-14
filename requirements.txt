@@ -1,3 +1,8 @@
 boto3[crt]
 streamlit
-opencv-python
+opencv-python-headless
+pyotp
+qrcode[pil]
+fastapi
+uvicorn
+httpx

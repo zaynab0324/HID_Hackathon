@@ -6,10 +6,14 @@ CONTRACT (all functions NEVER raise; on any Bedrock problem they return safe fal
     explain(decision: dict, face_result: dict, liveness_result: dict, person: dict | None) -> str
     ask(question: str, events: list[dict]) -> str
     summarize_performance(report: dict) -> str
+    spoof_opinion(image_bytes: bytes) -> {"spoof": True | False | None, "spoof_type": str | None,
+                                          "confidence": float, "reason": str}
+        A vision model's second opinion. Used ONLY to make decisions stricter.
 """
 import json
 
 import boto3
+from botocore.config import Config
 
 import config
 
@@ -19,7 +23,9 @@ _client = None
 def _bedrock():
     global _client
     if _client is None:
-        _client = boto3.client("bedrock-runtime", region_name=config.REGION)
+        _client = boto3.client("bedrock-runtime", region_name=config.REGION, config=Config(
+            connect_timeout=config.AWS_TIMEOUT_SECONDS, read_timeout=15,
+            retries={"max_attempts": 1}, max_pool_connections=20))
     return _client
 
 
@@ -85,3 +91,44 @@ def summarize_performance(report):
         return _chat(system, json.dumps(report, default=str), max_tokens=400)
     except Exception as e:
         return f"AI summary unavailable ({type(e).__name__})."
+
+
+INSPECTOR_PROMPT = (
+    "You are a presentation-attack detector for a face-recognition door kiosk. Look at this "
+    "webcam frame. Decide if it shows a LIVE person standing in front of the camera, or a spoof: "
+    "a printed photo, a photo or video shown on a phone/tablet/laptop screen, or a mask. "
+    "Clues of a spoof: phone or screen edges/bezel around the face, paper edges, fingers holding "
+    "something flat, screen glare or pixel/moire patterns, unnaturally flat face, mask edges or "
+    "eye holes. Reply with ONLY a JSON object, no other text: "
+    '{"spoof": true or false, "spoof_type": "printed_photo" | "screen_replay" | "video_replay" | '
+    '"mask" | null, "confidence": number between 0 and 1, "reason": "one short sentence"}'
+)
+
+
+def _parse_json(text):
+    start, end = text.find("{"), text.rfind("}")
+    return json.loads(text[start:end + 1])
+
+
+def spoof_opinion(image_bytes):
+    unknown = {"spoof": None, "spoof_type": None, "confidence": 0.0, "reason": "Inspector unavailable."}
+    try:
+        response = _bedrock().converse(
+            modelId=config.VISION_MODEL_ID,
+            messages=[{"role": "user", "content": [
+                {"image": {"format": "png" if image_bytes[:4] == b"\x89PNG" else "jpeg",
+                           "source": {"bytes": image_bytes}}},
+                {"text": INSPECTOR_PROMPT},
+            ]}],
+            inferenceConfig={"maxTokens": 150, "temperature": 0.0},
+        )
+        data = _parse_json(response["output"]["message"]["content"][0]["text"])
+        spoof = data.get("spoof")
+        return {
+            "spoof": spoof if isinstance(spoof, bool) else None,
+            "spoof_type": data.get("spoof_type") or None,
+            "confidence": max(0.0, min(1.0, float(data.get("confidence", 0.0)))),
+            "reason": str(data.get("reason", ""))[:200],
+        }
+    except Exception:
+        return unknown

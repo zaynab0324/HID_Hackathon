@@ -13,6 +13,7 @@ CONTRACT (other files rely on these exact names and return shapes - do not chang
 import re
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 import config
@@ -29,7 +30,9 @@ def _rek():
     """Create the Rekognition client and collection once, then reuse them."""
     global _client
     if _client is None:
-        _client = boto3.client("rekognition", region_name=config.REGION)
+        _client = boto3.client("rekognition", region_name=config.REGION, config=Config(
+            connect_timeout=config.AWS_TIMEOUT_SECONDS, read_timeout=config.AWS_TIMEOUT_SECONDS,
+            retries={"max_attempts": 1}, max_pool_connections=20))
         try:
             _client.create_collection(CollectionId=config.COLLECTION)
         except ClientError as e:

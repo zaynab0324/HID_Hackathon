@@ -26,9 +26,15 @@ import pipeline  # noqa: E402
 import rules  # noqa: E402
 import store  # noqa: E402
 
+import offline  # noqa: E402
+
 config.REQUIRE_ACTIVE_CHECK = False   # most tests check the passive rules; security mode tested below
+config.USE_GENAI_INSPECTOR = False    # tested separately below with a fake inspector
 store.PEOPLE_FILE = os.path.join(config.DATA_DIR, "people.json")
+store.SCHEDULE_FILE = os.path.join(config.DATA_DIR, "schedule.json")
 store.LOG_FILE = os.path.join(config.DATA_DIR, "access_log.json")
+offline.SECRETS_FILE = os.path.join(config.DATA_DIR, "offline_secrets.json")
+offline.QUEUE_FILE = os.path.join(config.DATA_DIR, "offline_queue.json")
 evaluate.REPORT_FILE = os.path.join(config.DATA_DIR, "eval_report.json")
 evaluate.DETAILS_FILE = os.path.join(config.DATA_DIR, "eval_details.csv")
 
@@ -113,6 +119,7 @@ try:
         check("enroll ok", r["ok"] and r["person_id"] == "Afrah_Zainab")
 
         # ---------- capture -> liveness -> identity -> decision ----------
+        store.upsert_person("afrah", status="active", role="staff")
         scene()
         ai_says("A live person was detected and identified as afrah.")
         r = pipeline.check_access(IMG)
@@ -157,6 +164,22 @@ try:
         scene(similarity="noface", faces=0)
         r = pipeline.check_access(IMG)
         check("no face -> RETRY", r["verdict"] == "RETRY")
+
+        # ---------- security mode ----------
+        config.REQUIRE_ACTIVE_CHECK = True
+        scene()
+        r = pipeline.check_access(IMG, use_ai=False)
+        check("security mode: passive alone -> REQUEST_VERIFICATION",
+              r["verdict"] == "REQUEST_VERIFICATION" and r["challenge"] is not None)
+        scene(labels=[{"Name": "Mobile Phone", "Instances": [{"BoundingBox": AROUND_FACE}]}])
+        check("security mode: obvious spoof still DENY",
+              pipeline.check_access(IMG, use_ai=False)["verdict"] == "DENY")
+        sm_challenge = {"id": "s1", "action": "smile", "instruction": "Smile",
+                        "expires_at": time.time() + 30}
+        scene(face_extra={"Smile": {"Value": True, "Confidence": 97}})
+        check("security mode: challenge passed -> ALLOW",
+              pipeline.verify_challenge(sm_challenge, IMG, use_ai=False)["verdict"] == "ALLOW")
+        config.REQUIRE_ACTIVE_CHECK = False
 
         # ---------- active challenge ----------
         challenge = {"id": "t1", "action": "smile", "instruction": "Smile",
@@ -216,6 +239,106 @@ try:
         r = pipeline.check_official(live_res, IMG, use_ai=False)
         check("official spoof -> DENY", r["verdict"] == "DENY")
 
+        # ---------- campus schedule ----------
+        from datetime import datetime, timedelta
+        monday_10 = datetime(2026, 11, 16, 10, 0)            # a Monday
+        store.upsert_person("riya", status="active", role="student")
+        store.add_slot("riya", "Lab 3", [0], "09:00", "11:00")
+        check("schedule in slot", store.check_schedule("riya", "Lab 3", monday_10)["status"] == "in_schedule")
+        check("schedule near slot", store.check_schedule("riya", "Lab 3", monday_10.replace(hour=11, minute=10))["status"] == "near_schedule")
+        check("schedule out of slot", store.check_schedule("riya", "Lab 3", monday_10.replace(hour=15))["status"] == "out_of_schedule")
+        check("schedule wrong room", store.check_schedule("riya", "Lab 5", monday_10)["status"] == "out_of_schedule")
+        store.upsert_person("riya", temp_pass={"location": "Lab 5", "until": (monday_10 + timedelta(hours=1)).isoformat()})
+        check("temporary pass", store.check_schedule("riya", "Lab 5", monday_10)["status"] == "in_schedule")
+
+        scene(pid="riya")
+        r = pipeline.check_access(IMG, use_ai=False, location="Lab 3", now=monday_10.replace(hour=15))
+        check("live + known + out of schedule -> DENY", r["verdict"] == "DENY" and r["schedule"]["status"] == "out_of_schedule")
+        r = pipeline.check_access(IMG, use_ai=False, location="Lab 3", now=monday_10.replace(hour=11, minute=10))
+        check("near schedule -> STEP-UP by guard", r["verdict"] == "REQUEST_VERIFICATION" and r["verification"] == "guard")
+        r = pipeline.check_access(IMG, use_ai=False, location="Lab 3", now=monday_10)
+        check("in schedule -> ALLOW", r["verdict"] == "ALLOW")
+        r = pipeline.check_access(IMG, use_ai=False, location="Lab 3", now=monday_10.replace(hour=15), use_schedule=False)
+        check("schedule can be skipped (evaluation)", r["verdict"] == "ALLOW")
+        check("timing breakdown present", {"identity", "face_attributes", "object_detection", "total"} <= set(r["timing"]))
+
+        # ---------- differential challenge ----------
+        smiling = {"BoundingBox": FACE_BOX, "Smile": {"Value": True, "Confidence": 97}}
+        for _ in range(20):
+            check_c = liveness.new_challenge(smiling)
+            assert check_c["action"] != "smile"
+        check("challenge never asks for what you already do", True)
+        static = {"id": "d1", "action": "smile", "instruction": "Smile", "expires_at": time.time() + 30,
+                  "baseline": {"smile": True, "eyes_open": True, "mouth_open": False, "yaw": 0.0}}
+        scene(face_extra={"Smile": {"Value": True, "Confidence": 97}})
+        r = pipeline.verify_challenge(static, IMG, use_ai=False)
+        check("no change from first photo -> DENY", r["verdict"] == "DENY")
+
+        # ---------- GenAI inspector (can only make it stricter) ----------
+        config.USE_GENAI_INSPECTOR = True
+        real_opinion = genai.spoof_opinion
+        genai.spoof_opinion = lambda img: {"spoof": True, "spoof_type": "screen_replay", "confidence": 0.95, "reason": "Phone bezel visible."}
+        scene()
+        r = pipeline.check_access(IMG, use_ai=False)
+        check("inspector sure spoof -> DENY", r["verdict"] == "DENY" and r["liveness"]["spoof_type"] == "screen_replay")
+        genai.spoof_opinion = lambda img: {"spoof": True, "spoof_type": None, "confidence": 0.6, "reason": "Maybe a screen."}
+        r = pipeline.check_access(IMG, use_ai=False)
+        check("inspector unsure -> STEP-UP", r["verdict"] == "REQUEST_VERIFICATION")
+        genai.spoof_opinion = lambda img: {"spoof": False, "spoof_type": None, "confidence": 0.99, "reason": "Live."}
+        scene(labels=[{"Name": "Mobile Phone", "Instances": [{"BoundingBox": AROUND_FACE}]}])
+        r = pipeline.check_access(IMG, use_ai=False)
+        check("inspector can never loosen a DENY", r["verdict"] == "DENY")
+        genai.spoof_opinion = real_opinion
+        config.USE_GENAI_INSPECTOR = False
+
+        # ---------- offline mode ----------
+        import pyotp
+        offline.set_simulated_offline(True)
+        check("simulated offline", offline.is_online() is False)
+        secret = offline.enroll_code("riya")["secret"]
+        good = pyotp.TOTP(secret).now()
+        r = offline.offline_decide("riya", good, "Lab 3", monday_10, faces_in_view=1)
+        check("offline: code + schedule -> ALLOW", r["verdict"] == "ALLOW" and r["mode"] == "offline")
+        r = offline.offline_decide("riya", "000000" if good != "000000" else "111111", "Lab 3", monday_10, 1)
+        check("offline: wrong code -> DENY", r["verdict"] == "DENY")
+        r = offline.offline_decide("riya", pyotp.TOTP(secret).now(), "Lab 3", monday_10.replace(hour=15), 1)
+        check("offline: out of schedule -> DENY", r["verdict"] == "DENY")
+        r = offline.offline_decide("riya", pyotp.TOTP(secret).now(), "Lab 3", monday_10, faces_in_view=2)
+        check("offline: two people -> DENY", r["verdict"] == "DENY")
+        check("offline: never allows without a code", offline.offline_decide("afrah", "", "Lab 3", monday_10, 1)["verdict"] == "DENY")
+        check("offline: decisions queued (no photos)", len(offline.pending()) == 5 and "image" not in offline.pending()[0])
+        check("offline: no sync while offline", offline.sync() == 0)
+        offline.set_simulated_offline(False)
+        real_online = offline.is_online
+        offline.is_online = lambda force=False: True
+        before = len(store.recent_events(2000))
+        check("sync when back online", offline.sync() == 5 and offline.pending() == [])
+        check("synced into central log", len(store.recent_events(2000)) == before + 5)
+
+        # ---------- kiosk server API ----------
+        from fastapi.testclient import TestClient
+        import server
+        client = TestClient(server.app)
+        check("api status", client.get("/api/status").json()["online"] is True)
+        real_get, real_check_official = official_liveness.get_result, pipeline.check_official
+        official_liveness.get_result = lambda sid: ({"live": True, "score": 0.98, "spoof_type": None,
+                                                     "signals": {"aws_confidence": 98.0}, "source": "aws_face_liveness",
+                                                     "reasons": ["AWS Face Liveness confidence 98.0%."]}, IMG)
+        scene()
+        res = client.post("/api/decide", json={"session_id": "a" * 36}).json()
+        check("api decide -> ALLOW with timing", res["verdict"] == "ALLOW" and res["timing"]["total"] == res["decision_ms"])
+        official_liveness.get_result = lambda sid: ({"live": False, "score": 0.1, "spoof_type": "presentation_attack",
+                                                     "signals": {}, "source": "aws_face_liveness", "reasons": ["low"]}, IMG)
+        check("api decide spoof -> DENY", client.post("/api/decide", json={"session_id": "a" * 36}).json()["verdict"] == "DENY")
+        official_liveness.get_result = real_get
+        offline.is_online = lambda force=False: False
+        check("api session offline -> 503", client.post("/api/session", json={}).status_code == 503)
+        r = client.post("/api/offline/decide", json={"person_id": "riya", "code": "12"}).json()
+        check("api offline decide", r["verdict"] == "DENY" and r["mode"] == "offline")
+        offline.is_online = real_online
+        offline.QUEUE_FILE = os.path.join(config.DATA_DIR, "offline_queue.json")
+        check("api override", client.post("/api/override", json={"person_id": "riya", "verdict": "ALLOW"}).json()["verdict"] == "ALLOW")
+
         # ---------- evaluation ----------
         for folder in ("genuine", "printed_photo", "screen_photo"):
             os.makedirs(os.path.join(config.TEST_DATA_DIR, folder))
@@ -224,8 +347,8 @@ try:
                     f.write(IMG)
         real_check = pipeline.check_access
 
-        def fake_check(image_bytes, use_ai=True, log=True):
-            return real_check(image_bytes, use_ai=False, log=False)
+        def fake_check(image_bytes, use_ai=True, log=True, **kw):
+            return real_check(image_bytes, use_ai=False, log=False, use_schedule=False)
 
         scene()  # every image looks live + known -> spoof images will be accepted
         pipeline.check_access = fake_check
@@ -237,6 +360,8 @@ try:
         check("eval false accept 100% when spoofs pass", o["false_accept_rate_pct"] == 100.0)
         check("eval per-scenario table", set(report["scenarios"]) == {"genuine", "printed_photo", "screen_photo"})
         check("eval report saved", evaluate.load_report()["total_images"] == 6)
+        check("eval judges' metrics present", {"liveness_accuracy_pct", "face_auth_accuracy_pct", "apcer_pct",
+                                               "bpcer_pct", "false_accept_rate_pct", "false_reject_rate_pct"} <= set(o))
 
         rek_stub.assert_no_pending_responses()
         br_stub.assert_no_pending_responses()

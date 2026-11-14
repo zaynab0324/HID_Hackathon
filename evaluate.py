@@ -8,6 +8,8 @@ Folder layout (webcam photos taken with the team's laptop, with consent):
     test_data/screen_photo/   photo shown on a phone screen    -> expected NOT ALLOW
     test_data/video_replay/   video playing on a phone screen  -> expected NOT ALLOW
     test_data/mask/           (optional)                       -> expected NOT ALLOW
+    test_data/impostor/       real faces of NON-enrolled people -> must not match anyone
+Name genuine files "<Person_ID>__01.jpg" so face-authentication accuracy checks the right person.
 
 Run:   python evaluate.py
 Writes: data/eval_report.json (shown in the app's Performance tab) and data/eval_details.csv
@@ -53,11 +55,13 @@ def run_evaluation(test_dir=None):
             if not name.lower().endswith(IMAGE_EXT):
                 continue
             with open(os.path.join(folder, name), "rb") as f:
-                result = pipeline.check_access(f.read(), use_ai=False, log=False)
+                result = pipeline.check_access(f.read(), use_ai=False, log=False, use_schedule=False)
             live = result["liveness"]
+            expected = name.split("__")[0] if "__" in name else None   # e.g. Afrah_Zainab__01.jpg
             rows.append({
                 "scenario": scenario,
                 "file": name,
+                "expected_person": expected,
                 "verdict": result["verdict"],
                 "person_id": result["person_id"],
                 "similarity": result["similarity"],
@@ -82,6 +86,10 @@ def run_evaluation(test_dir=None):
             "max_ms": max(times) if times else None,
             "under_2s_pct": _pct(sum(t <= config.DECISION_BUDGET_MS for t in times), n),
         }
+        live_vals = [r["live"] for r in items]
+        entry["flagged_spoof_pct"] = _pct(sum(v is False for v in live_vals), n)
+        entry["flagged_unsure_pct"] = _pct(sum(v is None for v in live_vals), n)
+        entry["passed_as_live_pct"] = _pct(sum(v is True for v in live_vals), n)
         if scenario == GENUINE:
             entry["correct_allow_pct"] = _pct(count["ALLOW"], n)
             entry["false_reject_pct"] = _pct(count["DENY"], n)
@@ -97,13 +105,28 @@ def run_evaluation(test_dir=None):
                 entry[f"avg_{sig[4:]}"] = round(statistics.mean(vals), 4)
         scenarios[scenario] = entry
 
-    spoof_rows = [r for r in rows if r["scenario"] != GENUINE]
+    spoof_rows = [r for r in rows if r["scenario"] not in (GENUINE, "impostor")]
     genuine_rows = [r for r in rows if r["scenario"] == GENUINE]
+    impostor_rows = [r for r in rows if r["scenario"] == "impostor"]
+
+    def auth_ok(r):
+        matched = r["person_id"] is not None and (r["similarity"] or 0) >= config.MATCH_THRESHOLD
+        return matched and (r["expected_person"] in (None, r["person_id"]))
+
+    live_correct = (sum(r["live"] is not False for r in genuine_rows)
+                    + sum(r["live"] is not True for r in spoof_rows))
     all_times = [r["decision_ms"] for r in rows]
     report = {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "total_images": len(rows),
         "overall": {
+            "liveness_accuracy_pct": _pct(live_correct, len(genuine_rows) + len(spoof_rows)),
+            "face_auth_accuracy_pct": _pct(sum(auth_ok(r) for r in genuine_rows), len(genuine_rows)),
+            "apcer_pct": _pct(sum(r["live"] is True for r in spoof_rows), len(spoof_rows)),
+            "bpcer_pct": _pct(sum(r["live"] is False for r in genuine_rows), len(genuine_rows)),
+            "identity_false_match_pct": _pct(sum(r["person_id"] is not None and (r["similarity"] or 0)
+                                                 >= config.MATCH_THRESHOLD for r in impostor_rows),
+                                             len(impostor_rows)),
             "spoof_detection_pct": _pct(sum(r["verdict"] != "ALLOW" for r in spoof_rows),
                                         len(spoof_rows)),
             "false_accept_rate_pct": _pct(sum(r["verdict"] == "ALLOW" for r in spoof_rows),

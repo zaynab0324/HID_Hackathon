@@ -7,7 +7,8 @@ CONTRACT:
         face_details = face_service.detect_faces(image_bytes)   (Rekognition FaceDetails)
         labels       = detect_labels(image_bytes)               (Rekognition Labels)
     detect_labels(image_bytes: bytes) -> list[dict]
-    new_challenge() -> {"id": str, "action": str, "instruction": str, "expires_at": float}
+    new_challenge(baseline_face: dict | None = None)
+        -> {"id", "action", "instruction", "expires_at", "baseline"}   (action differs from the first photo)
     verify_challenge(challenge: dict, face_details: list[dict]) -> LivenessResult
 
     LivenessResult = {
@@ -159,25 +160,39 @@ def passive_check(image_bytes, face_details, labels):
 
 
 # ---------------------------------------------------------------- active challenge
+# Differential challenge: the action must CHANGE the face compared with the first photo.
+# A printed photo or a screen cannot change its expression on command.
 
 CHALLENGES = {
     "turn_left": "Turn your head to the LEFT",
     "turn_right": "Turn your head to the RIGHT",
     "smile": "Give a big SMILE",
     "close_eyes": "CLOSE your eyes",
-    "open_mouth": "OPEN your mouth",
+    "open_mouth": "OPEN your mouth wide",
 }
 
 
-def new_challenge():
-    action = random.choice(list(CHALLENGES))
-    return {"id": uuid.uuid4().hex[:8], "action": action, "instruction": CHALLENGES[action],
-            "expires_at": time.time() + config.CHALLENGE_SECONDS}
-
-
-def _attribute(face, name, min_conf=80):
+def _attribute(face, name):
     attr = face.get(name, {})
-    return attr.get("Value") if attr.get("Confidence", 0) >= min_conf else None
+    return attr.get("Value") if attr.get("Confidence", 0) >= config.ATTRIBUTE_CONFIDENCE else None
+
+
+def _state(face):
+    """The facial state a challenge is compared against."""
+    return {"smile": _attribute(face, "Smile"), "eyes_open": _attribute(face, "EyesOpen"),
+            "mouth_open": _attribute(face, "MouthOpen"),
+            "yaw": round(face.get("Pose", {}).get("Yaw", 0.0), 1)}
+
+
+def new_challenge(baseline_face=None):
+    """Pick a random action the person is NOT already doing in the first photo."""
+    base = _state(baseline_face) if baseline_face else {}
+    already = {"smile": base.get("smile") is True, "close_eyes": base.get("eyes_open") is False,
+               "open_mouth": base.get("mouth_open") is True}
+    options = [a for a in config.CHALLENGE_ACTIONS if not already.get(a)] or list(config.CHALLENGE_ACTIONS)
+    action = random.choice(options)
+    return {"id": uuid.uuid4().hex[:8], "action": action, "instruction": CHALLENGES[action],
+            "expires_at": time.time() + config.CHALLENGE_SECONDS, "baseline": base}
 
 
 def verify_challenge(challenge, face_details):
@@ -188,19 +203,30 @@ def verify_challenge(challenge, face_details):
         return _result(False, 0.0, "challenge_failed", {"faces": len(face_details)},
                        "challenge", ["Exactly one face must be visible for verification."])
 
-    face = face_details[0]
+    now_state = _state(face_details[0])
+    base = challenge.get("baseline") or {}
     action = challenge["action"]
-    yaw = face.get("Pose", {}).get("Yaw", 0.0) * config.YAW_LEFT_SIGN
-    passed = {
+    yaw = now_state["yaw"] * config.YAW_LEFT_SIGN
+    base_yaw = (base.get("yaw") or 0.0) * config.YAW_LEFT_SIGN
+    done = {
         "turn_left": yaw > config.TURN_YAW_DEGREES,
         "turn_right": yaw < -config.TURN_YAW_DEGREES,
-        "smile": _attribute(face, "Smile") is True,
-        "close_eyes": _attribute(face, "EyesOpen") is False,
-        "open_mouth": _attribute(face, "MouthOpen") is True,
+        "smile": now_state["smile"] is True,
+        "close_eyes": now_state["eyes_open"] is False,
+        "open_mouth": now_state["mouth_open"] is True,
     }[action]
-    signals = {"action": action, "yaw": round(face.get("Pose", {}).get("Yaw", 0.0), 1)}
-    if passed:
+    changed = {
+        "turn_left": yaw - base_yaw > config.TURN_YAW_DEGREES,
+        "turn_right": base_yaw - yaw > config.TURN_YAW_DEGREES,
+        "smile": base.get("smile") is not True,
+        "close_eyes": base.get("eyes_open") is not False,
+        "open_mouth": base.get("mouth_open") is not True,
+    }[action]
+    signals = {"action": action, "baseline": base, "now": now_state}
+    if done and changed:
         return _result(True, 0.95, None, signals, "challenge",
-                       [f"Completed the random action: {CHALLENGES[action].lower()}."])
-    return _result(False, 0.1, "challenge_failed", signals, "challenge",
-                   [f"Did not complete the random action: {CHALLENGES[action].lower()}."])
+                       [f"Completed the random action ({CHALLENGES[action].lower()}) "
+                        "and the face changed from the first photo."])
+    reason = (f"Did not complete the random action: {CHALLENGES[action].lower()}." if not done
+              else "The face did not change from the first photo (possible photo or replay).")
+    return _result(False, 0.1, "challenge_failed", signals, "challenge", [reason])
