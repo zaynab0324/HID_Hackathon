@@ -44,8 +44,9 @@ class OverrideIn(BaseModel):
 
 class EnrollIn(BaseModel):
     session_id: str
-    person_id: str
-    password: str
+    token: str | None = None          # one-time token issued by the admin console
+    person_id: str | None = None
+    password: str | None = None
     role: str = "student"
     status: str = "active"
 
@@ -130,8 +131,13 @@ def decide(body: DecideIn):
 @app.post("/api/enroll")
 def enroll(body: EnrollIn):
     """Liveness-verified enrollment: only a LIVE face (AWS Face Liveness) can become a stored vector."""
-    if body.password != config.ADMIN_PASSWORD:
-        raise HTTPException(403, "Wrong staff password.")
+    if body.token:
+        ticket = security.consume_enroll_token(body.token)
+        if ticket is None:
+            raise HTTPException(403, "Enrollment link expired or already used. Start again from the admin console.")
+        body.person_id, body.role, body.status = ticket["person_id"], ticket["role"], ticket["status"]
+    elif body.password != config.ADMIN_PASSWORD:
+        raise HTTPException(403, "Enrollment must be started from the admin console.")
     person_id = face_service.clean_person_id(body.person_id)
     if not person_id:
         raise HTTPException(400, "Use only letters, numbers, spaces, _ - . or :")
@@ -166,6 +172,14 @@ def enroll(body: EnrollIn):
     store.log_event({"verdict": "ENROLLED", "person_id": person_id, "mode": "enroll",
                      "reasons": [f"Liveness-verified enrollment ({conf}%)."]})
     return {"ok": True, "message": f"{person_id} enrolled with a liveness-verified face ({conf}%)."}
+
+
+@app.get("/api/enroll_token/{token}")
+def enroll_token(token: str):
+    item = security.peek_enroll_token(token)
+    if item is None:
+        raise HTTPException(404, "Enrollment link expired or already used. Start again from the admin console.")
+    return {"person_id": item["person_id"], "role": item["role"], "status": item["status"]}
 
 
 @app.post("/api/override")

@@ -186,8 +186,10 @@ export default function App() {
   const [testLabel, setTestLabel] = useState("");
   const [credMode, setCredMode] = useState("");
   const [door, setDoor] = useState("");
-  const [mode, setMode] = useState("access"); // access | enroll
-  const [enrollForm, setEnrollForm] = useState({ person_id: "", role: "student", status: "active", password: "" });
+  // Enrollment is started from the admin console, which opens this page with ?enroll=<one-time token>.
+  const enrollToken = new URLSearchParams(window.location.search).get("enroll");
+  const [mode] = useState(enrollToken ? "enroll" : "access"); // access | enroll
+  const [enrollInfo, setEnrollInfo] = useState(null);
   const [enrollMsg, setEnrollMsg] = useState(null);
   const [voiceOn, setVoiceOn] = useState(true);
   const showResult = (r) => {
@@ -210,6 +212,13 @@ export default function App() {
     return () => clearInterval(id);
   }, [refresh]);
 
+  useEffect(() => {
+    if (!enrollToken) return;
+    api(`/api/enroll_token/${enrollToken}`)
+      .then(setEnrollInfo)
+      .catch((e) => setEnrollMsg({ ok: false, message: e.message }));
+  }, [enrollToken]);
+
   const start = async () => {
     setError("");
     setResult(null);
@@ -229,7 +238,16 @@ export default function App() {
   const onAnalysisComplete = async () => {
     setPhase("deciding");
     try {
-      showResult(await api("/api/decide", { session_id: session.sessionId, test_label: testLabel || null }));
+      if (mode === "enroll") {
+        setEnrollMsg(await api("/api/enroll", { session_id: session.sessionId, token: enrollToken }));
+        setPhase("idle");
+      } else {
+        showResult(await api("/api/decide", {
+          session_id: session.sessionId,
+          test_label: testLabel || null,
+          location: door || status?.location || null,
+        }));
+      }
     } catch (e) {
       setError(e.message);
       setPhase("idle");
@@ -316,24 +334,17 @@ export default function App() {
         </div>
       ) : mode === "enroll" ? (
         <div className="card">
-          <h2>👤 Staff: liveness-verified enrollment</h2>
-          <p className="muted">Only a LIVE face (AWS Face Liveness ≥ 97%) can be enrolled. Photos, screens and masks
-            are rejected, and a face already enrolled under another name is refused.</p>
-          <input className="field" placeholder="Person ID (e.g. Afrah Zainab)" value={enrollForm.person_id}
-            onChange={(e) => setEnrollForm({ ...enrollForm, person_id: e.target.value })} />
-          <select className="field" value={enrollForm.role} onChange={(e) => setEnrollForm({ ...enrollForm, role: e.target.value })}>
-            <option value="student">student</option><option value="staff">staff</option>
-          </select>
-          <select className="field" value={enrollForm.status} onChange={(e) => setEnrollForm({ ...enrollForm, status: e.target.value })}>
-            <option value="active">active</option><option value="suspended">suspended</option>
-          </select>
-          <input className="field" type="password" placeholder="Staff password" value={enrollForm.password}
-            onChange={(e) => setEnrollForm({ ...enrollForm, password: e.target.value })} />
+          <h2>👤 Liveness-verified enrollment</h2>
+          {enrollInfo && !enrollMsg && (
+            <p>Enrolling <b>{enrollInfo.person_id.replaceAll("_", " ")}</b> ({enrollInfo.role}, {enrollInfo.status}).
+              The person now does the liveness check. Only a LIVE face (≥ 97%) is accepted. Photos, screens and masks
+              are rejected, and a face already enrolled under another name is refused.</p>
+          )}
           {enrollMsg && <div className={`card ${enrollMsg.ok ? "okmsg" : "error"}`}>{enrollMsg.ok ? "✅" : "⛔"} {enrollMsg.message}</div>}
-          <button className="big" disabled={!enrollForm.person_id || !enrollForm.password} onClick={() => { setEnrollMsg(null); start(); }}>
-            Start liveness enrollment
-          </button>
-          <button onClick={() => { setMode("access"); setEnrollMsg(null); }}>Back to kiosk</button>
+          {enrollInfo && !enrollMsg && (
+            <button className="big" onClick={start}>Start liveness check</button>
+          )}
+          {enrollMsg && <p className="muted">You can close this tab and return to the admin console.</p>}
         </div>
       ) : (
         <div className="card center">
@@ -341,7 +352,7 @@ export default function App() {
           {testLabel && <p className="testbadge">🧪 Test mode: this attempt is recorded as <b>{testLabel.replaceAll("_", " ")}</b></p>}
           <p>Look at the camera and follow the instructions. We check that you are a real person and that you are allowed in.</p>
           <button className="big" onClick={start}>Start</button>
-          <div><button onClick={() => setMode("enroll")}>👤 Staff: enroll a new person</button></div>
+
           <p className="muted">
             AI is used to check liveness and identity. Your photo is not stored; only a face vector is kept,
             and it can be deleted on request. Uncertain cases go to a human.

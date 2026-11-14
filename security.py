@@ -11,6 +11,9 @@ CONTRACT:
     alerts(limit=50) -> list[dict]
     reset_threat() -> None                             # a guard confirms the threat is handled
     last_allow(person_id, now=None) -> {"location": str, "minutes_ago": float} | None
+    issue_enroll_token(person_id, role, status) -> str    # admin console: 5-min, single-use
+    peek_enroll_token(token) -> dict | None
+    consume_enroll_token(token) -> dict | None
 """
 import json
 import os
@@ -25,6 +28,8 @@ import store
 
 ALERTS_FILE = os.path.join(config.DATA_DIR, "alerts.json")
 RESET_FILE = os.path.join(config.DATA_DIR, "threat_reset.txt")
+ENROLL_TOKENS_FILE = os.path.join(config.DATA_DIR, "enroll_tokens.json")
+ENROLL_TOKEN_SECONDS = 300
 _sessions = {}
 _lock = threading.Lock()
 
@@ -202,3 +207,41 @@ def on_decision(result):
 
 def alerts(limit=50):
     return list(reversed(_load_alerts()[-limit:]))
+
+
+# ------------------------------------------------------------ enrollment tokens
+
+def _load_tokens():
+    try:
+        with open(ENROLL_TOKENS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_tokens(tokens):
+    os.makedirs(os.path.dirname(ENROLL_TOKENS_FILE) or ".", exist_ok=True)
+    with open(ENROLL_TOKENS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tokens, f)
+
+
+def issue_enroll_token(person_id, role, status):
+    import secrets
+    token = secrets.token_urlsafe(16)
+    tokens = {k: v for k, v in _load_tokens().items() if v["expires"] > time.time()}
+    tokens[token] = {"person_id": person_id, "role": role, "status": status,
+                     "expires": time.time() + ENROLL_TOKEN_SECONDS}
+    _save_tokens(tokens)
+    return token
+
+
+def peek_enroll_token(token):
+    item = _load_tokens().get(token)
+    return item if item and item["expires"] > time.time() else None
+
+
+def consume_enroll_token(token):
+    tokens = _load_tokens()
+    item = tokens.pop(token, None)
+    _save_tokens(tokens)
+    return item if item and item["expires"] > time.time() else None

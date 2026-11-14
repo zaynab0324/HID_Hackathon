@@ -54,14 +54,40 @@ enroll_tab, sched_tab, offline_tab, perf_tab, sec_tab, admin_tab = st.tabs(
 
 # ======================================================== Enroll
 with enroll_tab:
-    st.success("🔐 **Liveness-verified enrollment.** New people are enrolled on the kiosk page "
-               "(http://localhost:8000 → **👤 Staff: enroll a new person**). Enrollment runs the same "
-               f"AWS Face Liveness check (≥ {config.ENROLL_LIVE_CONFIDENCE}% live) and refuses a face "
-               "that is already enrolled under another name, so nobody can enroll a photo, video, mask "
-               "or someone else's face.")
-    st.caption("Plain photo enrollment is disabled on purpose: it would let an attacker poison the "
-               "face database with a photo of someone else.")
-    st.dataframe(store.list_persons(), width="stretch")
+    st.write("Enrollment uses the **same AWS Face Liveness check as the door**: only a LIVE face "
+             f"(≥ {config.ENROLL_LIVE_CONFIDENCE}%) can be stored, and a face that is already enrolled "
+             "under another name is refused. A photo, video or mask can never be enrolled.")
+    c1, c2, c3 = st.columns([2, 1, 1])
+    person_input = c1.text_input("Person ID (e.g. Afrah Zainab)")
+    role = c2.selectbox("Role", ["student", "staff"], help="Staff can enter at any time.")
+    status = c3.selectbox("Access status", ["active", "suspended"])
+    if st.button("Start liveness enrollment", type="primary"):
+        pid = face_service.clean_person_id(person_input)
+        if not pid:
+            st.warning("Type a valid Person ID (letters, numbers, spaces, _ - . :).")
+        else:
+            token = security.issue_enroll_token(pid, role, status)
+            st.session_state["enroll_link"] = (pid, f"http://localhost:{config.SERVER_PORT}/?enroll={token}")
+    if st.session_state.get("enroll_link"):
+        pid, link = st.session_state["enroll_link"]
+        st.link_button(f"📷 Open the liveness check for {pid} (new tab)", link)
+        st.caption("The link works once and expires in 5 minutes. The person looks into the oval; "
+                   "the result appears there and in the list below.")
+        if st.button("Refresh list"):
+            st.rerun()
+
+    st.subheader("Enrolled people")
+    people = store.list_persons()
+    if people:
+        st.dataframe([{k: p.get(k) for k in ("person_id", "role", "status", "enrolled_via",
+                                             "enroll_liveness")} for p in people], width="stretch")
+    else:
+        st.info("Nobody enrolled yet.")
+    recent = [e for e in store.recent_events(50) if e.get("mode") == "enroll"][:5]
+    if recent:
+        st.caption("Latest enrollment attempts")
+        st.dataframe([{"time": e.get("time"), "result": e.get("verdict"), "person": e.get("person_id"),
+                       "reason": " ".join(e.get("reasons", []))} for e in recent], width="stretch")
 
 # ======================================================== Schedule
 with sched_tab:

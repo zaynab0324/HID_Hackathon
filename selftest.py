@@ -460,6 +460,13 @@ try:
                                                      "signals": {"aws_confidence": 99.2}, "source": "aws_face_liveness",
                                                      "reasons": []}, IMG)
         body = {"person_id": "New Person", "password": config.ADMIN_PASSWORD, "role": "student", "status": "active"}
+        security.ENROLL_TOKENS_FILE = os.path.join(config.DATA_DIR, "enroll_tokens.json")
+        tok = security.issue_enroll_token("Token_Person", "staff", "active")
+        check("enroll link shows who is enrolled", client.get(f"/api/enroll_token/{tok}").json()["person_id"] == "Token_Person")
+        res = client.post("/api/enroll", json={"session_id": fresh_session(), "token": tok}).json()
+        check("enroll via admin-console link", res["ok"] and store.get_person("Token_Person")["role"] == "staff")
+        check("enroll link is single-use",
+              client.post("/api/enroll", json={"session_id": fresh_session(), "token": tok}).status_code == 403)
         check("enroll needs staff password",
               client.post("/api/enroll", json={**body, "session_id": fresh_session(), "password": "x"}).status_code == 403)
         res = client.post("/api/enroll", json={**body, "session_id": fresh_session()}).json()
