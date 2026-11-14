@@ -27,6 +27,7 @@ import rules  # noqa: E402
 import store  # noqa: E402
 
 import offline  # noqa: E402
+import security  # noqa: E402
 
 config.REQUIRE_ACTIVE_CHECK = False   # most tests check the passive rules; security mode tested below
 config.USE_GENAI_INSPECTOR = False    # tested separately below with a fake inspector
@@ -35,6 +36,11 @@ store.SCHEDULE_FILE = os.path.join(config.DATA_DIR, "schedule.json")
 store.LOG_FILE = os.path.join(config.DATA_DIR, "access_log.json")
 offline.SECRETS_FILE = os.path.join(config.DATA_DIR, "offline_secrets.json")
 offline.QUEUE_FILE = os.path.join(config.DATA_DIR, "offline_queue.json")
+security.ALERTS_FILE = os.path.join(config.DATA_DIR, "alerts.json")
+security.RESET_FILE = os.path.join(config.DATA_DIR, "threat_reset.txt")
+REAL_THREAT = security.threat_status
+NO_THREAT = {"active": False, "spoof_attempts": 0, "until": None, "targeted_ids": [], "reason": ""}
+security.threat_status = lambda now=None: NO_THREAT   # threat mode is tested on its own below
 evaluate.REPORT_FILE = os.path.join(config.DATA_DIR, "eval_report.json")
 evaluate.DETAILS_FILE = os.path.join(config.DATA_DIR, "eval_details.csv")
 
@@ -319,17 +325,24 @@ try:
         from fastapi.testclient import TestClient
         import server
         client = TestClient(server.app)
+        counter = [0]
+
+        def fresh_session():
+            counter[0] += 1
+            sid = f"{counter[0]:036d}"
+            security.register_session(sid)
+            return sid
         check("api status", client.get("/api/status").json()["online"] is True)
         real_get, real_check_official = official_liveness.get_result, pipeline.check_official
         official_liveness.get_result = lambda sid: ({"live": True, "score": 0.98, "spoof_type": None,
                                                      "signals": {"aws_confidence": 98.0}, "source": "aws_face_liveness",
                                                      "reasons": ["AWS Face Liveness confidence 98.0%."]}, IMG)
         scene()
-        res = client.post("/api/decide", json={"session_id": "a" * 36}).json()
+        res = client.post("/api/decide", json={"session_id": fresh_session()}).json()
         check("api decide -> ALLOW with timing", res["verdict"] == "ALLOW" and res["timing"]["total"] == res["decision_ms"])
         official_liveness.get_result = lambda sid: ({"live": False, "score": 0.1, "spoof_type": "presentation_attack",
                                                      "signals": {}, "source": "aws_face_liveness", "reasons": ["low"]}, IMG)
-        check("api decide spoof -> DENY", client.post("/api/decide", json={"session_id": "a" * 36}).json()["verdict"] == "DENY")
+        check("api decide spoof -> DENY", client.post("/api/decide", json={"session_id": fresh_session()}).json()["verdict"] == "DENY")
         official_liveness.get_result = real_get
         offline.is_online = lambda force=False: False
         check("api session offline -> 503", client.post("/api/session", json={}).status_code == 503)
@@ -342,18 +355,146 @@ try:
                                                      "reasons": []}, IMG)
         offline.is_online = lambda force=False: True
         scene()
-        client.post("/api/decide", json={"session_id": "a" * 36, "test_label": "genuine"})
+        client.post("/api/decide", json={"session_id": fresh_session(), "test_label": "genuine"})
         official_liveness.get_result = lambda sid: ({"live": False, "score": 0.05, "spoof_type": "presentation_attack",
                                                      "signals": {"aws_confidence": 5.0}, "source": "aws_face_liveness",
                                                      "reasons": []}, IMG)
-        client.post("/api/decide", json={"session_id": "a" * 36, "test_label": "screen_photo"})
+        client.post("/api/decide", json={"session_id": fresh_session(), "test_label": "screen_photo"})
         official_liveness.get_result = real_get
         offline.is_online = real_online
         live_rep = evaluate.live_kiosk_report(store.recent_events(2000))
         check("live kiosk report: labelled attempts", live_rep["attempts"] == 2)
         check("live kiosk report: metrics", live_rep["overall"]["liveness_accuracy_pct"] == 100.0
               and live_rep["overall"]["false_accept_rate_pct"] == 0.0)
-        check("api override", client.post("/api/override", json={"person_id": "riya", "verdict": "ALLOW"}).json()["verdict"] == "ALLOW")
+        check("api override needs the guard PIN",
+              client.post("/api/override", json={"person_id": "riya", "verdict": "ALLOW", "pin": "0000"}).status_code == 403)
+        check("api override with PIN", client.post("/api/override", json={"person_id": "riya", "verdict": "ALLOW",
+                                                                         "pin": config.GUARD_PIN}).json()["verdict"] == "ALLOW")
+
+        # ---------- security: replay protection ----------
+        sid = fresh_session()
+        official_liveness.get_result = lambda s_: ({"live": True, "score": 0.98, "spoof_type": None,
+                                                     "signals": {"aws_confidence": 98.0}, "source": "aws_face_liveness",
+                                                     "reasons": []}, IMG)
+        offline.is_online = lambda force=False: True
+        scene()
+        check("session decided once", client.post("/api/decide", json={"session_id": sid}).status_code == 200)
+        check("replayed session blocked", client.post("/api/decide", json={"session_id": sid}).status_code == 400)
+        check("unknown session blocked", client.post("/api/decide", json={"session_id": "z" * 36}).status_code == 400)
+        old = fresh_session()
+        security._sessions[old]["issued"] -= config.SESSION_MAX_AGE_SECONDS + 1
+        check("expired session blocked", client.post("/api/decide", json={"session_id": old}).status_code == 400)
+        official_liveness.get_result = real_get
+        offline.is_online = real_online
+
+        # ---------- security: least-privilege credentials ----------
+        class FakeSTS:
+            def get_caller_identity(self):
+                return {"Account": "123456789012"}
+
+            def assume_role(self, **kw):
+                assert "StartFaceLivenessSession" in kw["Policy"] and kw["DurationSeconds"] == 900
+                return {"Credentials": {"AccessKeyId": "ASIAKIOSK", "SecretAccessKey": "s", "SessionToken": "t"}}
+
+        real_boto3 = security.boto3
+
+        class FakeBoto3:
+            @staticmethod
+            def client(name, **kw):
+                return FakeSTS()
+
+        security.boto3 = FakeBoto3
+        creds, mode = security.kiosk_credentials()
+        check("kiosk gets least-privilege credentials", mode == "least-privilege" and creds["accessKeyId"] == "ASIAKIOSK")
+        security.boto3 = real_boto3
+
+        # ---------- security: threat-adaptive mode ----------
+        security.threat_status = REAL_THREAT
+        security.reset_threat()
+        time.sleep(1.1)
+        check("normal mode after reset", security.threat_status()["active"] is False)
+        spoof_live = {"live": False, "score": 0.05, "spoof_type": "presentation_attack",
+                      "signals": {"aws_confidence": 3.0}, "source": "aws_face_liveness", "reasons": []}
+        scene(pid="riya")
+        r = pipeline.check_official(spoof_live, IMG, use_ai=False, location="Lab 3", now=None)
+        check("spoof -> DENY + alert", r["verdict"] == "DENY" and security.alerts()[0]["kind"] == "spoof_attempt")
+        t = security.threat_status()
+        check("threat mode active after spoof", t["active"] and "riya" in t["targeted_ids"])
+        okish = {"live": True, "score": 0.93, "spoof_type": None, "signals": {"aws_confidence": 93.0},
+                 "source": "aws_face_liveness", "reasons": []}
+        scene(pid="afrah")
+        r = pipeline.check_official(okish, IMG, use_ai=False)
+        check("under attack: 93% liveness needs re-capture", r["verdict"] == "REQUEST_VERIFICATION")
+        strong = {**okish, "signals": {"aws_confidence": 99.0}}
+        scene(pid="riya")
+        r = pipeline.check_official(strong, IMG, use_ai=False, location="Lab 3", now=None)
+        check("targeted identity needs a guard", r["verdict"] in ("REQUEST_VERIFICATION", "DENY")
+              and (r["verification"] == "guard" or r["schedule"]["status"] != "in_schedule"))
+        security.reset_threat()
+        time.sleep(1.1)
+        check("guard reset clears threat mode", security.threat_status()["active"] is False)
+        security.threat_status = lambda now=None: NO_THREAT
+
+        # ---------- security: impossible travel ----------
+        store.upsert_person("ravi", status="active", role="staff")
+        scene(pid="ravi")
+        strong_live = {"live": True, "score": 0.99, "spoof_type": None, "signals": {"aws_confidence": 99.0},
+                       "source": "aws_face_liveness", "reasons": []}
+        r1 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 3")
+        check("first door -> ALLOW", r1["verdict"] == "ALLOW")
+        r2 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Hostel A")
+        check("other door 0 min later -> DENY impossible travel",
+              r2["verdict"] == "DENY" and r2["flag"] == "impossible_travel")
+        check("impossible travel raises alert", security.alerts()[0]["kind"] == "impossible_travel")
+        r3 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 3")
+        check("same door again is fine", r3["verdict"] == "ALLOW")
+        later = datetime.now() + timedelta(minutes=config.IMPOSSIBLE_TRAVEL_MINUTES + 1)
+        r4 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Hostel A", now=later)
+        check("other door after the travel window -> ALLOW", r4["verdict"] == "ALLOW")
+
+        # ---------- security: liveness-verified enrollment ----------
+        real_get2, real_identify, real_enroll = official_liveness.get_result, face_service.identify, face_service.enroll
+        face_service.enroll = lambda img, pid: {"ok": True, "person_id": pid, "message": f"Enrolled {pid}"}
+        face_service.identify = lambda img: {"status": "NO_MATCH", "person_id": None, "similarity": 0.0, "message": ""}
+        official_liveness.get_result = lambda s_: ({"live": True, "score": 0.99, "spoof_type": None,
+                                                     "signals": {"aws_confidence": 99.2}, "source": "aws_face_liveness",
+                                                     "reasons": []}, IMG)
+        body = {"person_id": "New Person", "password": config.ADMIN_PASSWORD, "role": "student", "status": "active"}
+        check("enroll needs staff password",
+              client.post("/api/enroll", json={**body, "session_id": fresh_session(), "password": "x"}).status_code == 403)
+        res = client.post("/api/enroll", json={**body, "session_id": fresh_session()}).json()
+        check("live face enrolled", res["ok"] and store.get_person("New_Person")["enrolled_via"] == "aws_face_liveness")
+        official_liveness.get_result = lambda s_: ({"live": False, "score": 0.1, "spoof_type": "presentation_attack",
+                                                     "signals": {"aws_confidence": 12.0}, "source": "aws_face_liveness",
+                                                     "reasons": []}, IMG)
+        res = client.post("/api/enroll", json={**body, "person_id": "Photo Attack", "session_id": fresh_session()}).json()
+        check("photo/screen cannot be enrolled", res["ok"] is False and store.get_person("Photo_Attack") is None)
+        official_liveness.get_result = lambda s_: ({"live": True, "score": 0.99, "spoof_type": None,
+                                                     "signals": {"aws_confidence": 99.0}, "source": "aws_face_liveness",
+                                                     "reasons": []}, IMG)
+        face_service.identify = lambda img: {"status": "MATCH", "person_id": "afrah", "similarity": 99.5, "message": ""}
+        res = client.post("/api/enroll", json={**body, "person_id": "Fake Name", "session_id": fresh_session()}).json()
+        check("someone else's face under a new name refused", res["ok"] is False and "already enrolled as afrah" in res["message"])
+        check("duplicate enrollment raises alert", security.alerts()[0]["kind"] == "duplicate_enrollment")
+        official_liveness.get_result, face_service.identify, face_service.enroll = real_get2, real_identify, real_enroll
+
+        # ---------- security: tamper-evident log ----------
+        check("log integrity verified", store.verify_log()["ok"])
+        import json as _json
+        with open(store.LOG_FILE, encoding="utf-8") as f:
+            log_data = _json.load(f)
+        log_data[1]["verdict"] = "ALLOW" if log_data[1]["verdict"] != "ALLOW" else "DENY"
+        with open(store.LOG_FILE, "w", encoding="utf-8") as f:
+            _json.dump(log_data, f)
+        bad = store.verify_log()
+        check("tampering detected", bad["ok"] is False and bad["first_bad"] == 1)
+        log_data[1]["verdict"] = "ALLOW" if log_data[1]["verdict"] != "ALLOW" else "DENY"
+        with open(store.LOG_FILE, "w", encoding="utf-8") as f:
+            _json.dump(log_data, f)
+        del log_data[2]
+        with open(store.LOG_FILE, "w", encoding="utf-8") as f:
+            _json.dump(log_data, f)
+        check("deleted entry detected", store.verify_log()["ok"] is False)
 
         # ---------- evaluation ----------
         empty = evaluate.run_evaluation(os.path.join(TMP, "no_such_folder"))

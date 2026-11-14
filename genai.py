@@ -6,6 +6,9 @@ CONTRACT (all functions NEVER raise; on any Bedrock problem they return safe fal
     explain(decision: dict, face_result: dict, liveness_result: dict, person: dict | None) -> str
     ask(question: str, events: list[dict]) -> str
     summarize_performance(report: dict) -> str
+    incident_report(events: list[dict], alerts: list[dict]) -> str
+    parse_policy(text: str, people: list[str], locations: list[str], now) -> dict
+        Natural-language admin command -> a structured, validated access-policy change (never applied here).
     spoof_opinion(image_bytes: bytes) -> {"spoof": True | False | None, "spoof_type": str | None,
                                           "confidence": float, "reason": str}
         A vision model's second opinion. Used ONLY to make decisions stricter.
@@ -132,3 +135,78 @@ def spoof_opinion(image_bytes):
         }
     except Exception:
         return unknown
+
+
+def incident_report(events, alerts):
+    system = (
+        "You are a security operations assistant for HID entry kiosks. Using ONLY the access log "
+        "and alerts given, write a short incident report for the security team: 1) summary, "
+        "2) spoof/attack attempts (time, type, which identity was targeted), 3) denied or "
+        "step-up patterns worth checking, 4) recommended actions. Be factual and brief. "
+        "If there were no incidents, say so."
+    )
+    payload = {"alerts": alerts[:100],
+               "events": [{k: e.get(k) for k in ("time", "verdict", "person_id", "location",
+                                                 "reasons", "mode", "test_label")} for e in events[:200]]}
+    try:
+        return _chat(system, json.dumps(payload, default=str), max_tokens=700)
+    except Exception as e:
+        return f"AI incident report unavailable ({type(e).__name__})."
+
+
+POLICY_ACTIONS = {"add_slot", "temp_pass", "suspend", "activate", "unknown"}
+
+
+def parse_policy(text, people, locations, now):
+    """Turn an admin's plain-English command into ONE structured policy change. A human must confirm."""
+    system = (
+        "You convert an access-control admin's instruction into ONE JSON action. Allowed actions: "
+        "add_slot (recurring weekly access), temp_pass (temporary access for some hours from now), "
+        "suspend, activate, unknown. Use ONLY these people ids: " + ", ".join(people) + ". "
+        "Match names loosely (e.g. 'riya' -> 'Riya'). Use ONLY these locations: " + ", ".join(locations) + ". "
+        "Days are numbers Monday=0 ... Sunday=6. Times are 24h 'HH:MM'. "
+        f"Today is {now.strftime('%A %Y-%m-%d %H:%M')}. "
+        'Reply with ONLY JSON: {"action": ..., "person_id": ..., "location": ..., "days": [..], '
+        '"start": "HH:MM", "end": "HH:MM", "hours": number, "summary": "one sentence describing the change"}. '
+        "Omit fields an action does not need. If the request is unclear or unsafe, use action unknown "
+        "and explain in summary."
+    )
+    try:
+        data = _parse_json(_chat(system, text, max_tokens=250))
+    except Exception as e:
+        return {"action": "unknown", "summary": f"AI unavailable ({type(e).__name__})."}
+    return validate_policy(data, people, locations)
+
+
+def validate_policy(data, people, locations):
+    """Never trust model output: check every field before a human can apply it."""
+    action = data.get("action")
+    if action not in POLICY_ACTIONS or action == "unknown":
+        return {"action": "unknown", "summary": data.get("summary") or "Could not understand the request."}
+    pid = data.get("person_id")
+    match = {p.lower(): p for p in people}.get(str(pid).lower().replace(" ", "_")) if pid else None
+    if not match:
+        return {"action": "unknown", "summary": f"Unknown person '{pid}'. Enroll them first."}
+    out = {"action": action, "person_id": match, "summary": data.get("summary", "")}
+    if action in ("add_slot", "temp_pass"):
+        loc = {l.lower(): l for l in locations}.get(str(data.get("location", "")).lower())
+        if not loc:
+            return {"action": "unknown", "summary": f"Unknown location '{data.get('location')}'."}
+        out["location"] = loc
+    if action == "add_slot":
+        days = [int(d) for d in data.get("days", []) if str(d).isdigit() and 0 <= int(d) <= 6]
+        start, end = str(data.get("start", "")), str(data.get("end", ""))
+        ok_time = all(len(t) == 5 and t[2] == ":" and t[:2].isdigit() and t[3:].isdigit()
+                      and int(t[:2]) < 24 and int(t[3:]) < 60 for t in (start, end))
+        if not days or not ok_time or start >= end:
+            return {"action": "unknown", "summary": "Days or times were unclear. Please rephrase."}
+        out.update(days=sorted(set(days)), start=start, end=end)
+    if action == "temp_pass":
+        try:
+            hours = float(data.get("hours", 0))
+        except (TypeError, ValueError):
+            hours = 0
+        if not 0 < hours <= 24:
+            return {"action": "unknown", "summary": "Temporary passes must be 1-24 hours."}
+        out["hours"] = hours
+    return out

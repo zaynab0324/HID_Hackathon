@@ -73,6 +73,22 @@ GUARDRAIL_VERSION = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
 # ---------------- AWS Face Liveness (official) ----------------
 OFFICIAL_LIVE_CONFIDENCE = 90.0
 
+# ---------------- Security ----------------
+KIOSK_ROLE_NAME = "HIDKioskLivenessRole"       # browser credentials: StartFaceLivenessSession only
+SESSION_MAX_AGE_SECONDS = 180                  # a liveness session must be decided within 3 min, once
+THREAT_WINDOW_MINUTES = 15                     # heightened security lasts this long after a spoof
+THREAT_LIVE_CONFIDENCE = 95.0                  # stricter liveness bar while under attack
+ALERT_SNS_TOPIC_ARN = os.getenv("ALERT_SNS_TOPIC_ARN", "")   # optional: real-time alerts to guards
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "hid-admin-2026")
+GUARD_PIN = os.getenv("GUARD_PIN", "2468")
+
+ENROLL_LIVE_CONFIDENCE = 97.0                  # enrollment needs a very sure live face
+IMPOSSIBLE_TRAVEL_MINUTES = 5                  # allowed at two different doors faster than this = clone
+
+# ---------------- Server ----------------
+SERVER_HOST = os.getenv("HOST", "127.0.0.1")   # 0.0.0.0 on EC2
+SERVER_PORT = int(os.getenv("PORT", "8000"))
+
 # ---------------- Local data (never committed) ----------------
 DATA_DIR = os.getenv("DATA_DIR", "data")
 TEST_DATA_DIR = os.getenv("TEST_DATA_DIR", "test_data")

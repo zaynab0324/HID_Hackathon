@@ -10,13 +10,16 @@ CONTRACT:
     context keys:
         "after_challenge": True  when deciding after the random-action step
         "schedule": result of store.check_schedule(...)  (None = no schedule check)
+        "threat": result of security.threat_status()       (None = normal mode)
+        "last_allow": {"location", "minutes_ago"} of this person's last ALLOW (None = none)
+        "location": the door being decided
 """
 import config
 
 
-def _out(verdict, reasons, verification=None):
+def _out(verdict, reasons, verification=None, flag=None):
     return {"verdict": verdict, "reasons": reasons, "verification": verification,
-            "needs_verification": verification is not None}
+            "needs_verification": verification is not None, "flag": flag}
 
 
 def decide(face_result, liveness_result, person, context=None):
@@ -43,9 +46,32 @@ def decide(face_result, liveness_result, person, context=None):
     if person and person.get("status") == "suspended":
         return _out("DENY", [f"Identity {identity} confirmed but access is suspended."])
 
+    # 3b) IMPOSSIBLE TRAVEL: allowed at another door minutes ago -> cloned identity?
+    last = context.get("last_allow")
+    if (last and context.get("location") and last["location"] != context["location"]
+            and last["minutes_ago"] < config.IMPOSSIBLE_TRAVEL_MINUTES):
+        return _out("DENY", [f"Impossible travel: {face_result['person_id']} was allowed at "
+                             f"{last['location']} {last['minutes_ago']:.1f} min ago. "
+                             "Possible cloned identity: security alerted."], flag="impossible_travel")
+
     # 4) CAMPUS SCHEDULE: recognised is not the same as authorised.
     if schedule and schedule["status"] == "out_of_schedule":
         return _out("DENY", [f"Identity {identity} confirmed. {schedule['reason']}"])
+
+    # 4b) THREAT-ADAPTIVE: the kiosk was attacked recently -> stricter rules.
+    threat = context.get("threat") or {}
+    if threat.get("active"):
+        conf = (liveness_result.get("signals") or {}).get("aws_confidence")
+        if (liveness_result.get("source") == "aws_face_liveness" and conf is not None
+                and conf < config.THREAT_LIVE_CONFIDENCE):
+            return _out("REQUEST_VERIFICATION",
+                        [f"Heightened security: liveness {conf}% is below the "
+                         f"{config.THREAT_LIVE_CONFIDENCE}% bar used after recent attacks.",
+                         threat["reason"], "Please re-capture."], "challenge")
+        if face_result["person_id"] in threat.get("targeted_ids", []):
+            return _out("REQUEST_VERIFICATION",
+                        [f"Identity {identity} was targeted by a recent spoof attempt.",
+                         "Guard approval required."], "guard")
 
     # 5) Unsure liveness or unsure identity -> random-action challenge (once).
     unsure = liveness_result["live"] is None or face_result["status"] == "POSSIBLE"

@@ -35,3 +35,8 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .testmode { margin-top: 18px; font-size: 13px; color: var(--muted); text-align: center; }
 .testmode select { font-size: 13px; padding: 4px; border-radius: 6px; }
 .testbadge { background: #fff4d6; border-radius: 8px; padding: 6px 10px; display: inline-block; }
+.card.threat { border-left: 6px solid #c62828; background: #fff1f0; color: #7a1712; }
+button.voice { font-size: 13px; padding: 3px 10px; margin: 0; background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.4); }
+.door { font-size: 14px; border-radius: 6px; padding: 2px 4px; }
+.field { display: block; width: 100%; font-size: 16px; padding: 9px; margin: 6px 0; border-radius: 8px; border: 1px solid #c9d3df; }
+.card.okmsg { border-left: 6px solid var(--green); background: #effaf2; }

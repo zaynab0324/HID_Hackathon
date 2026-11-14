@@ -10,9 +10,11 @@ CONTRACT:
     delete_slot(slot_id) -> bool
     check_schedule(person_id, location, now: datetime) ->
         {"status": "in_schedule" | "near_schedule" | "out_of_schedule", "reason": str, "slot": dict | None}
-    log_event(event: dict) -> dict                    # adds "time"
+    log_event(event: dict) -> dict                    # adds "time", "prev_hash", "hash" (tamper-evident)
     recent_events(limit=50) -> list[dict]             # newest first
+    verify_log() -> {"ok": bool, "entries": int, "first_bad": int | None, "message": str}
 """
+import hashlib
 import json
 import os
 import uuid
@@ -137,12 +139,33 @@ def check_schedule(person_id, location, now):
 
 # ------------------------------------------------------------ access log
 
+def _entry_hash(entry):
+    body = {k: v for k, v in entry.items() if k != "hash"}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def log_event(event):
-    entry = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **event}
     log = _load(LOG_FILE, [])
+    entry = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), **event,
+             "prev_hash": log[-1].get("hash", "GENESIS") if log else "GENESIS"}
+    entry["hash"] = _entry_hash(entry)
     log.append(entry)
-    _save(LOG_FILE, log[-2000:])
+    _save(LOG_FILE, log)
     return entry
+
+
+def verify_log():
+    """Every entry must hash correctly and point to the previous entry's hash."""
+    log = _load(LOG_FILE, [])
+    for i, entry in enumerate(log):
+        expected_prev = log[i - 1].get("hash") if i else "GENESIS"
+        if entry.get("hash") != _entry_hash(json.loads(json.dumps(entry, default=str))) \
+                or entry.get("prev_hash") != expected_prev:
+            return {"ok": False, "entries": len(log), "first_bad": i,
+                    "message": f"Log tampered: entry {i} ({entry.get('time')}) was changed or "
+                               "an entry before it was removed."}
+    return {"ok": True, "entries": len(log), "first_bad": None,
+            "message": f"All {len(log)} entries verified: no tampering."}
 
 
 def recent_events(limit=50):

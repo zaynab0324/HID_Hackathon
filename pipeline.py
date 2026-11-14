@@ -32,6 +32,7 @@ import genai
 import liveness
 import offline
 import rules
+import security
 import store
 
 _pool = ThreadPoolExecutor(max_workers=6)
@@ -106,7 +107,11 @@ def _finish(face_result, live_result, face_details, start, timing, context, use_
     person = store.get_person(face_result["person_id"]) if face_result["person_id"] else None
     schedule = (store.check_schedule(face_result["person_id"], location, now)
                 if face_result["person_id"] and use_schedule else None)
-    decision = rules.decide(face_result, live_result, person, {**context, "schedule": schedule})
+    threat = security.threat_status(now)
+    last = security.last_allow(face_result["person_id"], now) if face_result["person_id"] else None
+    decision = rules.decide(face_result, live_result, person,
+                            {**context, "schedule": schedule, "threat": threat,
+                             "last_allow": last, "location": location})
     timing["schedule_and_rules"] = int((time.perf_counter() - t0) * 1000)
     decision_ms = int((time.perf_counter() - start) * 1000)   # decision time, before GenAI text
     timing["total"] = decision_ms
@@ -125,11 +130,14 @@ def _finish(face_result, live_result, face_details, start, timing, context, use_
         "similarity": face_result["similarity"], "liveness": live_result,
         "schedule": schedule, "inspector": inspector, "decision_ms": decision_ms,
         "timing": timing, "challenge": challenge, "explanation": explanation,
-        "location": location, "mode": "online", **(extra or {}),
+        "location": location, "mode": "online", "threat": threat if threat["active"] else None,
+        "flag": decision.get("flag"),
+        **(extra or {}),
     }
     if log and decision["verdict"] != "RETRY":
         logged = store.log_event({k: v for k, v in result.items() if k != "challenge"})
         result["time"] = logged["time"]
+        security.on_decision(result)
     return result
 
 

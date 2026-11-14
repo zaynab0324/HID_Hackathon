@@ -13,11 +13,23 @@ import face_service
 import genai
 import offline
 import pipeline
+import security
 import store
 
 st.set_page_config(page_title="HID Kiosk Admin", page_icon="🛡️", layout="wide")
 
 st.title("🛡️ HID Kiosk: Admin Console")
+
+# ---------------- staff login ----------------
+if not st.session_state.get("authed"):
+    pw = st.text_input("Staff password", type="password")
+    if st.button("Log in"):
+        if pw == config.ADMIN_PASSWORD:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
 st.caption("Checks that a REAL person is present (liveness) AND that it is the RIGHT person "
            "(identity), in under 2 seconds. AI makes the decision; uncertain cases get an extra "
            "verification step. Raw photos are not stored; face vectors can be deleted anytime.")
@@ -37,30 +49,19 @@ pipeline.warm_up()
 st.info("👉 The kiosk at the door (AWS Face Liveness) runs at **http://localhost:8000** "
         "(`python server.py`). This is the staff admin console.")
 
-enroll_tab, sched_tab, offline_tab, perf_tab, admin_tab = st.tabs(
-    ["Enroll", "Schedule", "Offline mode", "Performance", "Admin"])
+enroll_tab, sched_tab, offline_tab, perf_tab, sec_tab, admin_tab = st.tabs(
+    ["Enroll", "Schedule", "Offline mode", "Performance", "Security", "Admin"])
 
 # ======================================================== Enroll
 with enroll_tab:
-    person_input = st.text_input("Person ID (e.g. Afrah Zainab)")
-    status = st.selectbox("Access status", ["active", "suspended"])
-    role = st.selectbox("Role", ["student", "staff"], help="Staff can enter at any time.")
-    photo = st.camera_input("Enrollment photo (real person, good light)", key="enroll_cam")
-    if st.button("Enroll"):
-        if not person_input:
-            st.warning("Type a Person ID first.")
-        elif not photo:
-            st.warning("Take a photo first.")
-        else:
-            with st.spinner("Enrolling..."):
-                result = aws_call(face_service.enroll, photo.getvalue(), person_input,
-                                  default={"ok": False, "message": "Enrollment failed (see above)."})
-            if result["ok"]:
-                store.upsert_person(result["person_id"], status=status, role=role)
-                st.success(result["message"] + ". Now add a schedule slot (Schedule tab) and an "
-                           "offline code (Offline mode tab).")
-            else:
-                st.error(result["message"])
+    st.success("🔐 **Liveness-verified enrollment.** New people are enrolled on the kiosk page "
+               "(http://localhost:8000 → **👤 Staff: enroll a new person**). Enrollment runs the same "
+               f"AWS Face Liveness check (≥ {config.ENROLL_LIVE_CONFIDENCE}% live) and refuses a face "
+               "that is already enrolled under another name, so nobody can enroll a photo, video, mask "
+               "or someone else's face.")
+    st.caption("Plain photo enrollment is disabled on purpose: it would let an attacker poison the "
+               "face database with a photo of someone else.")
+    st.dataframe(store.list_persons(), width="stretch")
 
 # ======================================================== Schedule
 with sched_tab:
@@ -194,6 +195,49 @@ with perf_tab:
         st.caption(f"{report['total_images']} images · generated {report['generated']}")
         st.dataframe([{"scenario": name, **vals} for name, vals in report["scenarios"].items()],
                      width="stretch")
+
+# ======================================================== Security
+with sec_tab:
+    threat = security.threat_status()
+    if threat["active"]:
+        st.error(f"🚨 Heightened security mode: {threat['reason']}  \n"
+                 f"Targeted identities: {', '.join(threat['targeted_ids']) or 'none'}")
+        if st.button("Guard: threat handled (reset)"):
+            security.reset_threat()
+            st.rerun()
+    else:
+        st.success("🟢 Normal mode: no spoof attempts in the last "
+                   f"{config.THREAT_WINDOW_MINUTES} minutes.")
+
+    st.subheader("Tamper-evident audit log")
+    if st.button("Verify log integrity"):
+        res = store.verify_log()
+        (st.success if res["ok"] else st.error)(res["message"])
+
+    st.subheader("Least-privilege kiosk credentials")
+    st.write("The kiosk browser gets 15-minute credentials that can **only** start a Face Liveness "
+             f"session (IAM role `{config.KIOSK_ROLE_NAME}`). Create the role once:")
+    if st.button("Create / update kiosk role"):
+        arn = aws_call(security.ensure_kiosk_role)
+        if arn:
+            st.success(f"Role ready: {arn}. New kiosk sessions now use least-privilege credentials.")
+    if st.button("Test kiosk credentials"):
+        result = aws_call(security.kiosk_credentials)
+        if result:
+            mode = result[1]
+            (st.success if mode == "least-privilege" else st.warning)(f"Credential mode: {mode}")
+
+    st.subheader("Security alerts")
+    al = security.alerts(100)
+    if al:
+        st.dataframe(al, width="stretch")
+    else:
+        st.info("No alerts.")
+
+    st.subheader("AI incident report (Bedrock)")
+    if st.button("Generate incident report"):
+        with st.spinner("Writing report..."):
+            st.markdown(genai.incident_report(store.recent_events(300), al))
 
 # ======================================================== Admin
 with admin_tab:

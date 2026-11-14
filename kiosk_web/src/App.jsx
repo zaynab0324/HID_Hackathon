@@ -56,6 +56,7 @@ function Result({ result, onGuard, onRetry, onNext }) {
           </span>
         )}
         {result.mode === "offline" && <span>📴 <b>offline decision</b></span>}
+        {result.threat && <span>🚨 <b>heightened security</b></span>}
       </div>
       {Object.keys(t).length > 0 && (
         <div className="timing">
@@ -96,6 +97,12 @@ function Result({ result, onGuard, onRetry, onNext }) {
             <option value="impostor">impostor (real, not enrolled)</option>
           </select>
         </label>
+        {credMode && (
+          <div>
+            🔐 Browser credentials:{" "}
+            <b>{credMode === "least-privilege" ? "least-privilege (liveness only, 15 min)" : "development mode (full)"}</b>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -144,9 +151,30 @@ function OfflinePanel({ status, onResult }) {
             <option value="impostor">impostor (real, not enrolled)</option>
           </select>
         </label>
+        {credMode && (
+          <div>
+            🔐 Browser credentials:{" "}
+            <b>{credMode === "least-privilege" ? "least-privilege (liveness only, 15 min)" : "development mode (full)"}</b>
+          </div>
+        )}
       </div>
     </div>
   );
+}
+
+async function speak(text) {
+  try {
+    const res = await fetch("/api/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) return;
+    const url = URL.createObjectURL(await res.blob());
+    await new Audio(url).play();
+  } catch {
+    /* voice is optional */
+  }
 }
 
 export default function App() {
@@ -156,6 +184,17 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [testLabel, setTestLabel] = useState("");
+  const [credMode, setCredMode] = useState("");
+  const [door, setDoor] = useState("");
+  const [mode, setMode] = useState("access"); // access | enroll
+  const [enrollForm, setEnrollForm] = useState({ person_id: "", role: "student", status: "active", password: "" });
+  const [enrollMsg, setEnrollMsg] = useState(null);
+  const [voiceOn, setVoiceOn] = useState(true);
+  const showResult = (r) => {
+    setResult(r);
+    setPhase("result");
+    if (voiceOn && r?.speech) speak(r.speech);
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -176,7 +215,9 @@ export default function App() {
     setResult(null);
     setPhase("starting");
     try {
-      setSession(await api("/api/session", {}));
+      const s = await api("/api/session", {});
+      setSession(s);
+      setCredMode(s.credential_mode);
       setPhase("liveness");
     } catch (e) {
       if (e.status === 503) await refresh();
@@ -188,8 +229,7 @@ export default function App() {
   const onAnalysisComplete = async () => {
     setPhase("deciding");
     try {
-      setResult(await api("/api/decide", { session_id: session.sessionId, test_label: testLabel || null }));
-      setPhase("result");
+      showResult(await api("/api/decide", { session_id: session.sessionId, test_label: testLabel || null }));
     } catch (e) {
       setError(e.message);
       setPhase("idle");
@@ -198,8 +238,15 @@ export default function App() {
   };
 
   const onGuard = async (verdict) => {
-    await api("/api/override", { person_id: result.person_id, verdict });
-    setResult({ ...result, verdict, verification: null, explanation: `Guard set the decision to ${verdict}.` });
+    const pin = window.prompt("Guard PIN");
+    if (pin === null) return;
+    try {
+      await api("/api/override", { person_id: result.person_id, verdict, pin });
+      setResult({ ...result, verdict, verification: null, explanation: `Guard set the decision to ${verdict}.` });
+      if (voiceOn) speak(verdict === "ALLOW" ? "Approved by security. Access granted." : "Access denied by security.");
+    } catch (e) {
+      setError(e.message);
+    }
   };
 
   const reset = () => {
@@ -216,7 +263,17 @@ export default function App() {
       <header>
         <div className="brand">🛡️ HID Liveness Kiosk</div>
         <div className="meta">
-          📍 {status?.location || "..."} · {offline ? <span className="off">● Offline</span> : <span className="on">● Online</span>}
+          📍{" "}
+          <select className="door" value={door || status?.location || ""} onChange={(e) => setDoor(e.target.value)}>
+            {(status?.locations || [status?.location || "..."]).map((l) => (
+              <option key={l} value={l}>{l}</option>
+            ))}
+          </select>{" "}
+          · {offline ? <span className="off">● Offline</span> : <span className="on">● Online</span>}
+          {" · "}
+          <button className="voice" onClick={() => setVoiceOn(!voiceOn)} title="Spoken feedback (accessibility)">
+            {voiceOn ? "🔊 Voice on" : "🔇 Voice off"}
+          </button>
         </div>
       </header>
 
@@ -228,12 +285,16 @@ export default function App() {
         <span className={phase === "result" ? "active" : ""}>5. Decision</span>
       </div>
 
+      {status?.threat?.active && (
+        <div className="card threat">🚨 <b>Heightened security.</b> {status.threat.reason}</div>
+      )}
+
       {error && <div className="card error">⚠️ {error}</div>}
 
       {phase === "result" && result ? (
         <Result result={result} onGuard={onGuard} onRetry={start} onNext={reset} />
       ) : offline ? (
-        <OfflinePanel status={status} onResult={(r) => { setResult(r); setPhase("result"); refresh(); }} />
+        <OfflinePanel status={status} onResult={(r) => { showResult(r); refresh(); }} />
       ) : phase === "liveness" && session ? (
         <div className="card detector">
           <FaceLivenessDetectorCore
@@ -253,12 +314,34 @@ export default function App() {
           <div className="spinner" />
           <p>{phase === "starting" ? "Preparing the liveness check..." : "Checking liveness, identity and schedule..."}</p>
         </div>
+      ) : mode === "enroll" ? (
+        <div className="card">
+          <h2>👤 Staff: liveness-verified enrollment</h2>
+          <p className="muted">Only a LIVE face (AWS Face Liveness ≥ 97%) can be enrolled. Photos, screens and masks
+            are rejected, and a face already enrolled under another name is refused.</p>
+          <input className="field" placeholder="Person ID (e.g. Afrah Zainab)" value={enrollForm.person_id}
+            onChange={(e) => setEnrollForm({ ...enrollForm, person_id: e.target.value })} />
+          <select className="field" value={enrollForm.role} onChange={(e) => setEnrollForm({ ...enrollForm, role: e.target.value })}>
+            <option value="student">student</option><option value="staff">staff</option>
+          </select>
+          <select className="field" value={enrollForm.status} onChange={(e) => setEnrollForm({ ...enrollForm, status: e.target.value })}>
+            <option value="active">active</option><option value="suspended">suspended</option>
+          </select>
+          <input className="field" type="password" placeholder="Staff password" value={enrollForm.password}
+            onChange={(e) => setEnrollForm({ ...enrollForm, password: e.target.value })} />
+          {enrollMsg && <div className={`card ${enrollMsg.ok ? "okmsg" : "error"}`}>{enrollMsg.ok ? "✅" : "⛔"} {enrollMsg.message}</div>}
+          <button className="big" disabled={!enrollForm.person_id || !enrollForm.password} onClick={() => { setEnrollMsg(null); start(); }}>
+            Start liveness enrollment
+          </button>
+          <button onClick={() => { setMode("access"); setEnrollMsg(null); }}>Back to kiosk</button>
+        </div>
       ) : (
         <div className="card center">
           <h1>Welcome</h1>
           {testLabel && <p className="testbadge">🧪 Test mode: this attempt is recorded as <b>{testLabel.replaceAll("_", " ")}</b></p>}
           <p>Look at the camera and follow the instructions. We check that you are a real person and that you are allowed in.</p>
           <button className="big" onClick={start}>Start</button>
+          <div><button onClick={() => setMode("enroll")}>👤 Staff: enroll a new person</button></div>
           <p className="muted">
             AI is used to check liveness and identity. Your photo is not stored; only a face vector is kept,
             and it can be deleted on request. Uncertain cases go to a human.
@@ -278,6 +361,12 @@ export default function App() {
             <option value="impostor">impostor (real, not enrolled)</option>
           </select>
         </label>
+        {credMode && (
+          <div>
+            🔐 Browser credentials:{" "}
+            <b>{credMode === "least-privilege" ? "least-privilege (liveness only, 15 min)" : "development mode (full)"}</b>
+          </div>
+        )}
       </div>
     </div>
   );
