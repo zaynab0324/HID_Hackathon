@@ -30,6 +30,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kiosk_web", 
 class DecideIn(BaseModel):
     session_id: str
     location: str | None = None
+    test_label: str | None = None      # set by the kiosk's test mode, for the performance report
 
 
 class OverrideIn(BaseModel):
@@ -93,8 +94,9 @@ def decide(body: DecideIn):
                       "explanation": "The liveness check did not finish. Please try again.",
                       "mode": "online"}
             return result
+        extra = {"test_label": body.test_label} if body.test_label else None
         result = pipeline.check_official(live_result, reference, use_ai=True,
-                                         location=body.location)
+                                         location=body.location, extra=extra)
     except pipeline.OfflineError:
         return _offline_error()
     except pipeline.NETWORK_ERRORS:

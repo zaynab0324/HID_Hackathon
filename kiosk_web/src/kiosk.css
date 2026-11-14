@@ -32,3 +32,6 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .spinner { width:42px; height:42px; border:5px solid #dfe6ee; border-top-color:var(--blue); border-radius:50%; margin:10px auto; animation:spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .detector { padding:8px; }
+.testmode { margin-top: 18px; font-size: 13px; color: var(--muted); text-align: center; }
+.testmode select { font-size: 13px; padding: 4px; border-radius: 6px; }
+.testbadge { background: #fff4d6; border-radius: 8px; padding: 6px 10px; display: inline-block; }

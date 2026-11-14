@@ -44,8 +44,24 @@ def _p95(values):
     return ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
 
 
-def run_evaluation(test_dir=None):
+SCENARIOS = ["genuine", "printed_photo", "screen_photo", "video_replay", "mask", "impostor"]
+
+
+def ensure_folders(test_dir=None):
     test_dir = test_dir or config.TEST_DATA_DIR
+    for name in SCENARIOS:
+        os.makedirs(os.path.join(test_dir, name), exist_ok=True)
+    return test_dir
+
+
+def count_images(test_dir=None):
+    test_dir = ensure_folders(test_dir)
+    return {name: len([f for f in os.listdir(os.path.join(test_dir, name))
+                       if f.lower().endswith(IMAGE_EXT)]) for name in SCENARIOS}
+
+
+def run_evaluation(test_dir=None):
+    test_dir = ensure_folders(test_dir)
     rows = []
     for scenario in sorted(os.listdir(test_dir)):
         folder = os.path.join(test_dir, scenario)
@@ -151,6 +167,56 @@ def run_evaluation(test_dir=None):
             writer.writeheader()
             writer.writerows(rows)
     return report
+
+
+LIVE_ATTACKS = {"printed_photo", "screen_photo", "video_replay", "mask"}
+
+
+def live_kiosk_report(events):
+    """Metrics from REAL kiosk attempts (AWS Face Liveness), labelled with the kiosk's test mode."""
+    tests = [e for e in events if e.get("test_label")]
+    if not tests:
+        return None
+    genuine = [e for e in tests if e["test_label"] == "genuine"]
+    attacks = [e for e in tests if e["test_label"] in LIVE_ATTACKS]
+    impostors = [e for e in tests if e["test_label"] == "impostor"]
+
+    def live_flag(e):
+        return (e.get("liveness") or {}).get("live")
+
+    times = [e["decision_ms"] for e in tests if isinstance(e.get("decision_ms"), (int, float))]
+    per = {}
+    for label in sorted({e["test_label"] for e in tests}):
+        items = [e for e in tests if e["test_label"] == label]
+        t = [e["decision_ms"] for e in items if isinstance(e.get("decision_ms"), (int, float))]
+        conf = [(e.get("liveness") or {}).get("signals", {}).get("aws_confidence") for e in items]
+        conf = [c for c in conf if isinstance(c, (int, float))]
+        per[label] = {
+            "attempts": len(items),
+            "ALLOW": sum(e["verdict"] == "ALLOW" for e in items),
+            "STEP_UP": sum(e["verdict"] == "REQUEST_VERIFICATION" for e in items),
+            "DENY": sum(e["verdict"] == "DENY" for e in items),
+            "avg_liveness_conf": round(statistics.mean(conf), 1) if conf else None,
+            "avg_ms": int(statistics.mean(t)) if t else None,
+            "max_ms": max(t) if t else None,
+        }
+    live_correct = (sum(live_flag(e) is True for e in genuine)
+                    + sum(live_flag(e) is not True for e in attacks))
+    return {
+        "attempts": len(tests),
+        "overall": {
+            "liveness_accuracy_pct": _pct(live_correct, len(genuine) + len(attacks)),
+            "face_auth_accuracy_pct": _pct(sum(e.get("person_id") is not None and
+                                               (e.get("similarity") or 0) >= config.MATCH_THRESHOLD
+                                               for e in genuine), len(genuine)),
+            "false_accept_rate_pct": _pct(sum(e["verdict"] == "ALLOW" for e in attacks + impostors),
+                                          len(attacks) + len(impostors)),
+            "false_reject_rate_pct": _pct(sum(e["verdict"] == "DENY" for e in genuine), len(genuine)),
+            "avg_decision_ms": int(statistics.mean(times)) if times else None,
+            "under_2s_pct": _pct(sum(t <= config.DECISION_BUDGET_MS for t in times), len(times)),
+        },
+        "per_scenario": per,
+    }
 
 
 def load_report():

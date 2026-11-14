@@ -83,6 +83,20 @@ function Result({ result, onGuard, onRetry, onNext }) {
         ) : null}
         <button onClick={onNext}>Next person</button>
       </div>
+      <div className="testmode">
+        <label>
+          🧪 Test mode (staff only, for the performance report):{" "}
+          <select value={testLabel} onChange={(e) => setTestLabel(e.target.value)}>
+            <option value="">off (normal use)</option>
+            <option value="genuine">genuine (real enrolled person)</option>
+            <option value="printed_photo">printed photo attack</option>
+            <option value="screen_photo">photo on a phone/screen</option>
+            <option value="video_replay">video replay attack</option>
+            <option value="mask">mask attack</option>
+            <option value="impostor">impostor (real, not enrolled)</option>
+          </select>
+        </label>
+      </div>
     </div>
   );
 }
@@ -117,6 +131,20 @@ function OfflinePanel({ status, onResult }) {
       </button>
       {error && <p className="error">{error}</p>}
       <p className="muted">{status?.pending_sync || 0} decision(s) waiting to sync when the connection returns.</p>
+      <div className="testmode">
+        <label>
+          🧪 Test mode (staff only, for the performance report):{" "}
+          <select value={testLabel} onChange={(e) => setTestLabel(e.target.value)}>
+            <option value="">off (normal use)</option>
+            <option value="genuine">genuine (real enrolled person)</option>
+            <option value="printed_photo">printed photo attack</option>
+            <option value="screen_photo">photo on a phone/screen</option>
+            <option value="video_replay">video replay attack</option>
+            <option value="mask">mask attack</option>
+            <option value="impostor">impostor (real, not enrolled)</option>
+          </select>
+        </label>
+      </div>
     </div>
   );
 }
@@ -127,6 +155,7 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
+  const [testLabel, setTestLabel] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -159,7 +188,7 @@ export default function App() {
   const onAnalysisComplete = async () => {
     setPhase("deciding");
     try {
-      setResult(await api("/api/decide", { session_id: session.sessionId }));
+      setResult(await api("/api/decide", { session_id: session.sessionId, test_label: testLabel || null }));
       setPhase("result");
     } catch (e) {
       setError(e.message);
@@ -227,6 +256,7 @@ export default function App() {
       ) : (
         <div className="card center">
           <h1>Welcome</h1>
+          {testLabel && <p className="testbadge">🧪 Test mode: this attempt is recorded as <b>{testLabel.replaceAll("_", " ")}</b></p>}
           <p>Look at the camera and follow the instructions. We check that you are a real person and that you are allowed in.</p>
           <button className="big" onClick={start}>Start</button>
           <p className="muted">
@@ -235,6 +265,20 @@ export default function App() {
           </p>
         </div>
       )}
+      <div className="testmode">
+        <label>
+          🧪 Test mode (staff only, for the performance report):{" "}
+          <select value={testLabel} onChange={(e) => setTestLabel(e.target.value)}>
+            <option value="">off (normal use)</option>
+            <option value="genuine">genuine (real enrolled person)</option>
+            <option value="printed_photo">printed photo attack</option>
+            <option value="screen_photo">photo on a phone/screen</option>
+            <option value="video_replay">video replay attack</option>
+            <option value="mask">mask attack</option>
+            <option value="impostor">impostor (real, not enrolled)</option>
+          </select>
+        </label>
+      </div>
     </div>
   );
 }

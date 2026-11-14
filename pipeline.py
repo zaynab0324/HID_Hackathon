@@ -99,7 +99,7 @@ def _apply_inspector(live_result, inspector_job, start, timing):
 
 
 def _finish(face_result, live_result, face_details, start, timing, context, use_ai, log,
-            location, now, inspector=None, use_schedule=True):
+            location, now, inspector=None, use_schedule=True, extra=None):
     location = location or config.KIOSK_LOCATION
     now = now or datetime.now()
     t0 = time.perf_counter()
@@ -125,7 +125,7 @@ def _finish(face_result, live_result, face_details, start, timing, context, use_
         "similarity": face_result["similarity"], "liveness": live_result,
         "schedule": schedule, "inspector": inspector, "decision_ms": decision_ms,
         "timing": timing, "challenge": challenge, "explanation": explanation,
-        "location": location, "mode": "online",
+        "location": location, "mode": "online", **(extra or {}),
     }
     if log and decision["verdict"] != "RETRY":
         logged = store.log_event({k: v for k, v in result.items() if k != "challenge"})
@@ -162,7 +162,7 @@ def verify_challenge(challenge, image_bytes, use_ai=True, log=True, location=Non
 
 
 def check_official(liveness_result, reference_image_bytes, use_ai=True, log=True,
-                   location=None, now=None):
+                   location=None, now=None, extra=None):
     """Decision after AWS Face Liveness has checked liveness (official_liveness.py)."""
     start = time.perf_counter()
     try:
@@ -171,7 +171,7 @@ def check_official(liveness_result, reference_image_bytes, use_ai=True, log=True
         offline.mark_offline()
         raise OfflineError(str(e)) from e
     return _finish(face_result, liveness_result, [], start, {"identity": timing_identity},
-                   {}, use_ai, log, location, now)
+                   {}, use_ai, log, location, now, extra=extra)
 
 
 def record_override(person_id, verdict, by, note=""):

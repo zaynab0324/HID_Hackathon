@@ -337,9 +337,27 @@ try:
         check("api offline decide", r["verdict"] == "DENY" and r["mode"] == "offline")
         offline.is_online = real_online
         offline.QUEUE_FILE = os.path.join(config.DATA_DIR, "offline_queue.json")
+        official_liveness.get_result = lambda sid: ({"live": True, "score": 0.97, "spoof_type": None,
+                                                     "signals": {"aws_confidence": 97.0}, "source": "aws_face_liveness",
+                                                     "reasons": []}, IMG)
+        offline.is_online = lambda force=False: True
+        scene()
+        client.post("/api/decide", json={"session_id": "a" * 36, "test_label": "genuine"})
+        official_liveness.get_result = lambda sid: ({"live": False, "score": 0.05, "spoof_type": "presentation_attack",
+                                                     "signals": {"aws_confidence": 5.0}, "source": "aws_face_liveness",
+                                                     "reasons": []}, IMG)
+        client.post("/api/decide", json={"session_id": "a" * 36, "test_label": "screen_photo"})
+        official_liveness.get_result = real_get
+        offline.is_online = real_online
+        live_rep = evaluate.live_kiosk_report(store.recent_events(2000))
+        check("live kiosk report: labelled attempts", live_rep["attempts"] == 2)
+        check("live kiosk report: metrics", live_rep["overall"]["liveness_accuracy_pct"] == 100.0
+              and live_rep["overall"]["false_accept_rate_pct"] == 0.0)
         check("api override", client.post("/api/override", json={"person_id": "riya", "verdict": "ALLOW"}).json()["verdict"] == "ALLOW")
 
         # ---------- evaluation ----------
+        empty = evaluate.run_evaluation(os.path.join(TMP, "no_such_folder"))
+        check("evaluation with no test data does not crash", empty["total_images"] == 0)
         for folder in ("genuine", "printed_photo", "screen_photo"):
             os.makedirs(os.path.join(config.TEST_DATA_DIR, folder))
             for i in range(2):
