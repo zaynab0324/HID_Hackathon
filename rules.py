@@ -13,6 +13,7 @@ CONTRACT:
     person:          store.get_person(...) or None
     context:         {"after_challenge": True} when deciding after a verification step
 """
+import config
 
 
 def _out(verdict, reasons, needs_verification=False):
@@ -53,5 +54,11 @@ def decide(face_result, liveness_result, person, context=None):
         return _out("REQUEST_VERIFICATION", [f"Extra verification needed: {why}.",
                                              f"Identity: {identity}."] + reasons, True)
 
-    # 5) Live person + confirmed identity -> ALLOW.
+    # 5) Security mode: a passive check alone is not enough proof of liveness.
+    if config.REQUIRE_ACTIVE_CHECK and liveness_result.get("source") == "passive":
+        return _out("REQUEST_VERIFICATION",
+                    ["Passive check passed; confirming liveness with a random action.",
+                     f"Identity: {identity}."], True)
+
+    # 6) Live person + confirmed identity -> ALLOW.
     return _out("ALLOW", [f"Live person detected and identity confirmed: {identity}."])

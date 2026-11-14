@@ -26,6 +26,7 @@ import pipeline  # noqa: E402
 import rules  # noqa: E402
 import store  # noqa: E402
 
+config.REQUIRE_ACTIVE_CHECK = False   # most tests check the passive rules; security mode tested below
 store.PEOPLE_FILE = os.path.join(config.DATA_DIR, "people.json")
 store.LOG_FILE = os.path.join(config.DATA_DIR, "access_log.json")
 evaluate.REPORT_FILE = os.path.join(config.DATA_DIR, "eval_report.json")

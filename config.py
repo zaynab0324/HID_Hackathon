@@ -1,3 +1,4 @@
+
 """Shared settings. Change values here (or via environment variables), never inside other files."""
 import os
 
@@ -29,6 +30,11 @@ GLARE_MAX = None          # spoof if glare_ratio above this
 MOIRE_MAX = None          # spoof if moire_score above this
 SHARPNESS_MIN = None      # spoof if sharpness below this
 
+# ---------------- Security mode ----------------
+# True = the passive check alone can NEVER give ALLOW: every person must also pass a random
+# action (or AWS Face Liveness). Photos and replayed videos cannot follow a random instruction.
+REQUIRE_ACTIVE_CHECK = True
+
 # ---------------- Active challenge (REQUEST VERIFICATION) ----------------
 CHALLENGE_SECONDS = 15    # a challenge expires after this
 TURN_YAW_DEGREES = 20     # head turn must exceed this angle
@@ -52,3 +58,4 @@ OFFICIAL_LIVE_CONFIDENCE = 90.0
 # ---------------- Local data (never committed) ----------------
 DATA_DIR = os.getenv("DATA_DIR", "data")
 TEST_DATA_DIR = os.getenv("TEST_DATA_DIR", "test_data")
+
