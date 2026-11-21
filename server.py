@@ -17,11 +17,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import config
+import base64
+import secrets
+import threading
+
 import evaluate
 import face_service
+import local_face
 import offline
 import official_liveness
 import pipeline
+import presence
 import security
 import store
 import voice
@@ -34,6 +40,7 @@ class DecideIn(BaseModel):
     session_id: str
     location: str | None = None
     test_label: str | None = None      # set by the kiosk's test mode, for the performance report
+    direction: str = "in"              # "in" = entry (check-in), "out" = check-out at the exit
 
 
 class OverrideIn(BaseModel):
@@ -41,6 +48,8 @@ class OverrideIn(BaseModel):
     verdict: str
     pin: str = ""
     note: str = ""
+    location: str | None = None
+    direction: str = "in"
 
 
 class EnrollIn(BaseModel):
@@ -55,6 +64,38 @@ class EnrollIn(BaseModel):
 class OfflineIn(BaseModel):
     person_id: str
     code: str
+
+
+class FrameIn(BaseModel):
+    phase: str | int
+    image: str                         # data URL or base64 JPEG
+
+
+class OfflineFaceIn(BaseModel):
+    challenge_id: str
+    frames: list[FrameIn]
+    location: str | None = None
+
+
+class LiveFrameIn(BaseModel):
+    challenge_id: str | None = None
+    image: str
+
+
+class FinishIn(BaseModel):
+    challenge_id: str
+    location: str | None = None
+    test_label: str | None = None       # kiosk test mode -> offline metrics
+
+
+class StepUpIn(BaseModel):
+    ticket: str
+    code: str
+    location: str | None = None
+
+
+_stepups = {}            # ticket -> (face_check, expires): weak offline match waiting for the code
+_stepup_lock = threading.Lock()
 
 
 class SimulateIn(BaseModel):
@@ -79,7 +120,11 @@ def status():
     return {"online": online, "simulated_offline": offline.is_simulated_offline(),
             "location": config.KIOSK_LOCATION, "pending_sync": len(offline.pending()),
             "just_synced": synced, "threat": threat, "locations": config.LOCATIONS,
-            "metrics": evaluate.live_kiosk_report(store.recent_events(2000))}
+            "offline_face_ready": local_face.available(),
+            "present": presence.present(),
+            "metrics": evaluate.live_kiosk_report(
+                [e for e in store.recent_events(2000) if e.get("mode") != "offline"]),
+            "offline_metrics": evaluate.offline_report()}
 
 
 @app.post("/api/session")
@@ -117,7 +162,8 @@ def decide(body: DecideIn):
             return result
         extra = {"test_label": body.test_label} if body.test_label else None
         result = pipeline.check_official(live_result, reference, use_ai=True,
-                                         location=body.location, extra=extra)
+                                         location=body.location, extra=extra,
+                                         direction="out" if body.direction == "out" else "in")
     except pipeline.OfflineError:
         return _offline_error()
     except pipeline.NETWORK_ERRORS:
@@ -133,11 +179,13 @@ def decide(body: DecideIn):
 @app.post("/api/enroll")
 def enroll(body: EnrollIn):
     """Liveness-verified enrollment: only a LIVE face (AWS Face Liveness) can become a stored vector."""
+    kind = "enroll"
     if body.token:
         ticket = security.consume_enroll_token(body.token)
         if ticket is None:
             raise HTTPException(403, "Enrollment link expired or already used. Start again from the admin console.")
         body.person_id, body.role, body.status = ticket["person_id"], ticket["role"], ticket["status"]
+        kind = ticket.get("kind", "enroll")
     elif body.password != config.ADMIN_PASSWORD:
         raise HTTPException(403, "Enrollment must be started from the admin console.")
     person_id = face_service.clean_person_id(body.person_id)
@@ -158,6 +206,8 @@ def enroll(body: EnrollIn):
                                         f"{config.ENROLL_LIVE_CONFIDENCE}% required. A photo, screen "
                                         "or mask cannot be enrolled."}
     existing = face_service.identify(reference)
+    if kind == "offline_vector":
+        return _save_offline_vector(person_id, reference, existing, conf)
     if existing["status"] == "MATCH" and existing["person_id"] != person_id:
         store.log_event({"verdict": "ENROLL_REJECTED", "person_id": person_id, "mode": "enroll",
                          "reasons": [f"Face already enrolled as {existing['person_id']}."]})
@@ -169,11 +219,45 @@ def enroll(body: EnrollIn):
     result = face_service.enroll(reference, person_id)
     if not result["ok"]:
         return result
+    try:   # offline face vector, saved ONLY here at liveness-verified enrollment (no photo kept)
+        offline_saved = local_face.save_vector(person_id, reference)
+    except Exception:
+        offline_saved = False
     store.upsert_person(person_id, role=body.role, status=body.status,
-                        enrolled_via="aws_face_liveness", enroll_liveness=conf)
+                        enrolled_via="aws_face_liveness", enroll_liveness=conf,
+                        offline_vector=offline_saved)
     store.log_event({"verdict": "ENROLLED", "person_id": person_id, "mode": "enroll",
                      "reasons": [f"Liveness-verified enrollment ({conf}%)."]})
-    return {"ok": True, "message": f"{person_id} enrolled with a liveness-verified face ({conf}%)."}
+    extra = " Offline face vector saved." if offline_saved else " (Offline face vector NOT saved.)"
+    return {"ok": True, "offline_vector": offline_saved,
+            "message": f"{person_id} enrolled with a liveness-verified face ({conf}%).{extra}"}
+
+
+def _save_offline_vector(person_id, reference, existing, conf):
+    """Already-enrolled person: store ONLY the offline vector, and only if AWS confirms it is the
+    same enrolled face (so nobody can attach their own face to someone else's account)."""
+    if existing["status"] != "MATCH" or existing["person_id"] != person_id:
+        who = existing.get("person_id") or "nobody"
+        store.log_event({"verdict": "OFFLINE_VECTOR_REJECTED", "person_id": person_id, "mode": "enroll",
+                         "reasons": [f"Live face matched {who}, not {person_id}."]})
+        if existing.get("person_id") and existing["person_id"] != person_id:
+            security.raise_alert("offline_vector_mismatch",
+                                 f"Tried to save {existing['person_id']}'s face as {person_id}'s offline vector.",
+                                 {"person_id": person_id, "location": config.KIOSK_LOCATION})
+        return {"ok": False, "message": f"Rejected: this live face is not the enrolled face of {person_id}."}
+    try:
+        saved = local_face.save_vector(person_id, reference)
+    except Exception:
+        saved = False
+    if not saved:
+        return {"ok": False, "message": "Could not compute the offline face vector (models missing or face "
+                                        "not found). Run python get_models.py and try again."}
+    store.upsert_person(person_id, offline_vector=True)
+    store.log_event({"verdict": "OFFLINE_VECTOR_SAVED", "person_id": person_id, "mode": "enroll",
+                     "reasons": [f"Live ({conf}%) and matched {person_id} ({existing['similarity']}%)."]})
+    return {"ok": True, "offline_vector": True,
+            "message": f"Offline face vector saved for {person_id} (live {conf}%, same enrolled face "
+                       f"{existing['similarity']}%)."}
 
 
 @app.get("/api/enroll_token/{token}")
@@ -181,14 +265,16 @@ def enroll_token(token: str):
     item = security.peek_enroll_token(token)
     if item is None:
         raise HTTPException(404, "Enrollment link expired or already used. Start again from the admin console.")
-    return {"person_id": item["person_id"], "role": item["role"], "status": item["status"]}
+    return {"person_id": item["person_id"], "role": item["role"], "status": item["status"],
+            "kind": item.get("kind", "enroll")}
 
 
 @app.post("/api/override")
 def override(body: OverrideIn):
     if body.pin != config.GUARD_PIN:
         raise HTTPException(403, "Wrong guard PIN.")
-    return pipeline.record_override(body.person_id, body.verdict, by="guard", note=body.note)
+    return pipeline.record_override(body.person_id, body.verdict, by="guard", note=body.note,
+                                    location=body.location, direction=body.direction)
 
 
 @app.post("/api/offline/decide")
@@ -198,6 +284,85 @@ def offline_decide(body: OfflineIn):
                                     datetime.now(), faces_in_view=1)
     result["speech"] = voice.speech_text(result)
     return result
+
+
+@app.post("/api/offline/challenge")
+def offline_challenge():
+    if not local_face.available():
+        raise HTTPException(503, "Offline face models missing. Run python get_models.py.")
+    ch = local_face.new_challenge()
+    return {"challenge_id": ch["id"], "actions": ch["actions"], "labels": ch["labels"]}
+
+
+def _decode_image(data):
+    if "," in data[:100]:
+        data = data.split(",", 1)[1]
+    try:
+        return base64.b64decode(data)
+    except Exception:
+        return b""
+
+
+def _offline_face_result(face_check, code, location, t0, test_label=None):
+    from datetime import datetime
+    result = offline.offline_face_decide(face_check, code, location or config.KIOSK_LOCATION,
+                                         datetime.now())
+    if result["verdict"] == "REQUEST_VERIFICATION":
+        ticket = secrets.token_urlsafe(12)
+        with _stepup_lock:
+            _stepups[ticket] = (face_check, time.time() + 120)
+        result["stepup_ticket"] = ticket
+    result["decision_ms"] = int((time.perf_counter() - t0) * 1000) + (face_check.get("frame_ms") or 0)
+    result["timing"] = {"last_frame_analysis": face_check.get("frame_ms") or 0,
+                        "offline_decision": result["decision_ms"] - (face_check.get("frame_ms") or 0),
+                        "avg_frame_ms": face_check.get("avg_frame_ms"),
+                        "frames_analysed": face_check.get("frames")}
+    result["timing"] = {k: v for k, v in result["timing"].items() if v is not None}
+    if test_label:
+        result["test_label"] = test_label
+        if result["verdict"] != "RETRY":
+            evaluate.record_offline_test(result)
+    result["speech"] = voice.speech_text(result)
+    return result
+
+
+@app.post("/api/offline/face")
+def offline_face(body: OfflineFaceIn):
+    """Offline access: local OpenCV face match + random-action liveness. No AWS."""
+    t0 = time.perf_counter()
+    frames = [{"phase": f.phase if f.phase == "baseline" else int(f.phase),
+               "image": _decode_image(f.image)} for f in body.frames[:60]]
+    face_check = local_face.verify(body.challenge_id, frames)
+    return _offline_face_result(face_check, None, body.location, t0)
+
+
+@app.post("/api/offline/detect")
+def offline_detect(body: LiveFrameIn):
+    """Live preview: face box + count, before the check starts."""
+    return local_face.detect(_decode_image(body.image))
+
+
+@app.post("/api/offline/frame")
+def offline_frame(body: LiveFrameIn):
+    """One frame of the live random-action check: returns progress for the kiosk screen."""
+    return local_face.process_frame(body.challenge_id or "", _decode_image(body.image))
+
+
+@app.post("/api/offline/finish")
+def offline_finish(body: FinishIn):
+    t0 = time.perf_counter()
+    return _offline_face_result(local_face.finish(body.challenge_id), None, body.location, t0,
+                                body.test_label)
+
+
+@app.post("/api/offline/stepup")
+def offline_stepup(body: StepUpIn):
+    t0 = time.perf_counter()
+    with _stepup_lock:
+        item = _stepups.pop(body.ticket, None)      # single use
+    if item is None or item[1] < time.time():
+        raise HTTPException(400, "Verification expired. Please start again.")
+    return _offline_face_result(item[0], body.code or "", body.location, t0)
 
 
 @app.post("/api/offline/simulate")

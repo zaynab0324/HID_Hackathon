@@ -31,6 +31,7 @@ import face_service
 import genai
 import liveness
 import offline
+import presence
 import rules
 import security
 import store
@@ -108,10 +109,16 @@ def _finish(face_result, live_result, face_details, start, timing, context, use_
     schedule = (store.check_schedule(face_result["person_id"], location, now)
                 if face_result["person_id"] and use_schedule else None)
     threat = security.threat_status(now)
-    last = security.last_allow(face_result["person_id"], now) if face_result["person_id"] else None
+    direction = context.get("direction", "in")
+    last = (security.last_allow(face_result["person_id"], now)
+            if face_result["person_id"] and direction == "in" else None)
+    here_now = presence.current(face_result["person_id"], now) if face_result["person_id"] else None
+    if direction == "out":
+        schedule = None                      # leaving is never blocked by the timetable
     decision = rules.decide(face_result, live_result, person,
                             {**context, "schedule": schedule, "threat": threat,
-                             "last_allow": last, "location": location})
+                             "last_allow": last, "location": location, "presence": here_now,
+                             "direction": direction})
     timing["schedule_and_rules"] = int((time.perf_counter() - t0) * 1000)
     decision_ms = int((time.perf_counter() - start) * 1000)   # decision time, before GenAI text
     timing["total"] = decision_ms
@@ -131,11 +138,18 @@ def _finish(face_result, live_result, face_details, start, timing, context, use_
         "schedule": schedule, "inspector": inspector, "decision_ms": decision_ms,
         "timing": timing, "challenge": challenge, "explanation": explanation,
         "location": location, "mode": "online", "threat": threat if threat["active"] else None,
-        "flag": decision.get("flag"),
+        "flag": decision.get("flag"), "direction": direction,
         **(extra or {}),
     }
+    if log and decision["verdict"] == "ALLOW" and face_result["person_id"]:
+        if direction == "out":
+            presence.check_out(face_result["person_id"], now)
+            result["presence"] = None
+        else:
+            result["presence"] = presence.check_in(face_result["person_id"], location, now, schedule)
     if log and decision["verdict"] != "RETRY":
-        logged = store.log_event({k: v for k, v in result.items() if k != "challenge"})
+        logged = store.log_event({"time": now.strftime("%Y-%m-%d %H:%M:%S"),   # time of the decision
+                                  **{k: v for k, v in result.items() if k != "challenge"}})
         result["time"] = logged["time"]
         security.on_decision(result)
     return result
@@ -170,7 +184,7 @@ def verify_challenge(challenge, image_bytes, use_ai=True, log=True, location=Non
 
 
 def check_official(liveness_result, reference_image_bytes, use_ai=True, log=True,
-                   location=None, now=None, extra=None):
+                   location=None, now=None, extra=None, direction="in"):
     """Decision after AWS Face Liveness has checked liveness (official_liveness.py)."""
     start = time.perf_counter()
     try:
@@ -179,13 +193,20 @@ def check_official(liveness_result, reference_image_bytes, use_ai=True, log=True
         offline.mark_offline()
         raise OfflineError(str(e)) from e
     return _finish(face_result, liveness_result, [], start, {"identity": timing_identity},
-                   {}, use_ai, log, location, now, extra=extra)
+                   {"direction": direction}, use_ai, log, location, now, extra=extra)
 
 
-def record_override(person_id, verdict, by, note=""):
+def record_override(person_id, verdict, by, note="", location=None, direction="in"):
+    if verdict == "ALLOW" and person_id and location:
+        if direction == "out":
+            presence.check_out(person_id)
+        else:
+            presence.check_in(person_id, location, datetime.now(),
+                              store.check_schedule(person_id, location, datetime.now()))
     return store.log_event({
         "verdict": verdict,
         "reasons": [f"Manual override by {by}." + (f" {note}" if note else "")],
         "person_id": person_id, "similarity": None, "liveness": None, "decision_ms": None,
         "explanation": f"A human ({by}) set this decision to {verdict}.", "mode": "override",
+        "location": location, "direction": direction,
     })

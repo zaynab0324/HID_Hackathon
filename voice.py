@@ -25,11 +25,17 @@ def speech_text(result):
     name = (result.get("person_id") or "").split("_")[0]
     live = (result.get("liveness") or {}).get("live")
     schedule = (result.get("schedule") or {}).get("status")
+    if verdict == "ALLOW" and result.get("direction") == "out":
+        return f"Goodbye{', ' + name if name else ''}. You are checked out."
     if verdict == "ALLOW":
         return f"Welcome{', ' + name if name else ''}. Access granted."
     if verdict == "DENY":
         if live is False:
             return "Access denied. A spoof attempt was detected. Security has been notified."
+        if result.get("flag") == "already_checked_in":
+            return "Access denied. You are already checked in at another lab. Security has been notified."
+        if result.get("flag") == "impossible_travel":
+            return "Access denied. This identity was just used at another door. Security has been notified."
         if schedule == "out_of_schedule":
             return "Access denied. You are not scheduled for this room right now."
         if result.get("mode") == "offline":

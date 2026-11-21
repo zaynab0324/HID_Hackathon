@@ -13,6 +13,8 @@ CONTRACT:
         "threat": result of security.threat_status()       (None = normal mode)
         "last_allow": {"location", "minutes_ago"} of this person's last ALLOW (None = none)
         "location": the door being decided
+        "direction": "in" (entry, default) | "out" (check-out at the exit)
+        "presence": presence.current(person) -> {"location", "since", "expires"} | None
 """
 import config
 
@@ -41,18 +43,46 @@ def decide(face_result, liveness_result, person, context=None):
         return _out("DENY", ["Face does not match any enrolled person."] + reasons)
 
     identity = f"{face_result['person_id']} ({face_result['similarity']}%)"
+    presence = context.get("presence")
+    here = context.get("location")
+
+    # CHECK-OUT at the exit: needs the same liveness + identity proof (nobody can check someone
+    # else out), but never traps a person inside: schedule / suspension don't block leaving.
+    if context.get("direction") == "out":
+        if liveness_result["live"] is None or face_result["status"] == "POSSIBLE":
+            return _out("REQUEST_VERIFICATION", ["Check-out needs a clear live face match. Please re-capture.",
+                                                 f"Identity: {identity}."], "challenge")
+        if presence and here and presence["location"] != here:
+            return _out("ALLOW", [f"{face_result['person_id']} checked out at {here}, but was checked in at "
+                                  f"{presence['location']} since {presence['since'][11:16]}. Mismatch flagged."],
+                        flag="checkout_mismatch")
+        if presence:
+            return _out("ALLOW", [f"Checked out of {presence['location']} (in since {presence['since'][11:16]}). "
+                                  f"Identity {identity}."])
+        return _out("ALLOW", [f"Exit recorded for {identity}. No open check-in was found."])
 
     # 3) ACCESS STATUS.
     if person and person.get("status") == "suspended":
         return _out("DENY", [f"Identity {identity} confirmed but access is suspended."])
 
-    # 3b) IMPOSSIBLE TRAVEL: allowed at another door minutes ago -> cloned identity?
+    # 3b) ALREADY CHECKED IN ELSEWHERE: still inside another lab (no check-out) -> one person,
+    #     two places: the second face is a clone / spoof / shared identity.
+    if presence and here and presence["location"] != here:
+        return _out("DENY", [f"{face_result['person_id']} is checked in at {presence['location']} since "
+                             f"{presence['since'][11:16]} and has not checked out. One person cannot be in two "
+                             "labs: possible cloned identity, security alerted. Check out there first."],
+                    flag="already_checked_in")
+
+    # 3c) IMPOSSIBLE TRAVEL: seen at another lab (entry or check-out) less than the minimum walking
+    #     time ago -> nobody can get here that fast: cloned identity?
     last = context.get("last_allow")
-    if (last and context.get("location") and last["location"] != context["location"]
+    if (last and here and last["location"] != here
             and last["minutes_ago"] < config.IMPOSSIBLE_TRAVEL_MINUTES):
-        return _out("DENY", [f"Impossible travel: {face_result['person_id']} was allowed at "
-                             f"{last['location']} {last['minutes_ago']:.1f} min ago. "
-                             "Possible cloned identity: security alerted."], flag="impossible_travel")
+        what = "checked out of" if last.get("direction") == "out" else "allowed at"
+        return _out("DENY", [f"Impossible travel: {face_result['person_id']} {what} {last['location']} only "
+                             f"{last['minutes_ago']:.1f} min ago; at least {config.IMPOSSIBLE_TRAVEL_MINUTES} min "
+                             f"are needed to reach {here}. Possible cloned identity: security alerted."],
+                    flag="impossible_travel")
 
     # 4) CAMPUS SCHEDULE: recognised is not the same as authorised.
     if schedule and schedule["status"] == "out_of_schedule":

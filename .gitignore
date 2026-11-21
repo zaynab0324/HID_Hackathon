@@ -9,3 +9,4 @@ node_modules/
 *.png
 .streamlit/secrets.toml
 .env
+models/*.onnx

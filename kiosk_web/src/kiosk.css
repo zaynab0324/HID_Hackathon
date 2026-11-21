@@ -41,3 +41,30 @@ button.voice { font-size: 13px; padding: 3px 10px; margin: 0; background: rgba(2
 .field { display: block; width: 100%; font-size: 16px; padding: 9px; margin: 6px 0; border-radius: 8px; border: 1px solid #c9d3df; }
 .card.okmsg { border-left: 6px solid var(--green); background: #effaf2; }
 .metrics { margin: 8px auto; max-width: 820px; background: #eef4fb; border-radius: 8px; padding: 6px 10px; color: #23384d; }
+
+/* offline face check */
+.offcam { position: relative; display: none; margin: 12px auto; max-width: 480px; border-radius: 12px; overflow: hidden; background: #000; }
+.offcam.on { display: block; }
+.offcam video { width: 100%; display: block; transform: scaleX(-1); }
+.offcam .instruction { position: absolute; left: 0; right: 0; bottom: 0; padding: 12px; background: rgba(0,0,0,.65); color: #fff; font-size: 1.3rem; font-weight: 700; text-align: center; }
+.offcam .count { opacity: .8; margin-left: 8px; }
+button.link { background: none; border: none; color: inherit; text-decoration: underline; cursor: pointer; padding: 0; }
+.stepup { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+.simulate { display: block; margin-top: 6px; }
+.offcam { min-height: 120px; }
+.offcam .facebox { position: absolute; border: 3px solid #22c55e; border-radius: 10px; pointer-events: none; transition: all .15s; }
+.offcam .facebox.bad { border-color: #ef4444; }
+.offcam .camnote { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; color: #fff; text-align: center; background: rgba(0,0,0,.6); }
+.offcam .camnote.bad { background: rgba(127,29,29,.85); }
+.facestate { text-align: center; font-weight: 600; margin: 4px 0; }
+.steps { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin: 6px 0 10px; }
+.steps span { padding: 4px 10px; border-radius: 999px; background: rgba(0,0,0,.06); }
+.steps span.done { background: #dcfce7; }
+.dirbuttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin: 10px 0; }
+button.big.secondary { background: #334155; }
+.dirtag { font-size: .85rem; font-weight: 700; letter-spacing: .04em; opacity: .75; margin-bottom: 4px; }
+.presence { margin: 10px 0; padding: 10px 12px; border-radius: 10px; font-size: 1rem; }
+.presence.in { background: #dcfce7; color: #14532d; }
+.presence.out { background: #e0f2fe; color: #0c4a6e; }
+.presence.flag { background: #fee2e2; color: #7f1d1d; }
+.presentlist { margin: 8px auto; padding: 8px 12px; border-radius: 10px; background: rgba(0,0,0,.05); font-size: .95rem; max-width: 640px; }

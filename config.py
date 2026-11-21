@@ -83,7 +83,8 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "hid-admin-2026")
 GUARD_PIN = os.getenv("GUARD_PIN", "2468")
 
 ENROLL_LIVE_CONFIDENCE = 97.0                  # enrollment needs a very sure live face
-IMPOSSIBLE_TRAVEL_MINUTES = 5                  # allowed at two different doors faster than this = clone
+IMPOSSIBLE_TRAVEL_MINUTES = 2                  # min. walking time between two labs: seen at another lab
+                                               # (entry OR check-out) less than this ago = clone
 
 # ---------------- Server ----------------
 SERVER_HOST = os.getenv("HOST", "127.0.0.1")   # 0.0.0.0 on EC2
@@ -92,3 +93,7 @@ SERVER_PORT = int(os.getenv("PORT", "8000"))
 # ---------------- Local data (never committed) ----------------
 DATA_DIR = os.getenv("DATA_DIR", "data")
 TEST_DATA_DIR = os.getenv("TEST_DATA_DIR", "test_data")
+
+# ---- presence (check-in / check-out) ----
+PRESENCE_GRACE_MINUTES = 30    # a check-in expires this long after the person's slot ends
+PRESENCE_MAX_HOURS = 8         # ...or after this long when there is no slot (staff, temp pass)

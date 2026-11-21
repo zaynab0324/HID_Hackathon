@@ -12,7 +12,9 @@ import evaluate
 import face_service
 import genai
 import offline
+import local_face
 import pipeline
+import presence
 import security
 import store
 
@@ -78,13 +80,36 @@ with enroll_tab:
         if st.button("Refresh list"):
             st.rerun()
 
+    st.subheader("Save offline face vector (already enrolled people)")
+    st.caption("For people enrolled before offline mode existed. The person does the AWS liveness check; "
+               "the vector is saved only if AWS confirms it is the SAME enrolled face.")
+    known = sorted({p.get("person_id") for p in store.list_persons() if p.get("person_id")} |
+                   set(aws_call(face_service.list_people, default={}) or {}))
+    if known:
+        missing = [k for k in known if not local_face.has_vector(k)]
+        who_v = st.selectbox("Person", missing or known, key="vec_person",
+                             help="People without an offline vector are listed first."
+                             if missing else "Everyone already has one; you can refresh it.")
+        if st.button("Save offline vector (liveness check)"):
+            rec = store.get_person(who_v) or {}
+            token = security.issue_enroll_token(who_v, rec.get("role", "student"),
+                                                rec.get("status", "active"), kind="offline_vector")
+            st.session_state["vector_link"] = (who_v, f"http://localhost:{config.SERVER_PORT}/?enroll={token}")
+        if st.session_state.get("vector_link"):
+            vp, vlink = st.session_state["vector_link"]
+            st.link_button(f"📷 Open the liveness check for {vp}'s offline vector (new tab)", vlink)
+            st.caption("Works once, expires in 5 minutes. Then press Refresh list.")
+    else:
+        st.info("Nobody enrolled yet.")
+
     st.subheader("Enrolled people")
     people = store.list_persons()
     if people:
         st.dataframe([{"Person": p.get("person_id"), "Role": p.get("role", "student"),
                        "Status": p.get("status", "active"),
                        "Enrolled via": p.get("enrolled_via", "-"),
-                       "Enrollment liveness %": p.get("enroll_liveness")} for p in people],
+                       "Enrollment liveness %": p.get("enroll_liveness"),
+                       "Offline vector": "yes" if local_face.has_vector(p.get("person_id")) else "no"} for p in people],
                      width="stretch")
         st.caption("Change a person's status (active / suspended) in the Admin tab.")
     else:
@@ -136,6 +161,27 @@ with sched_tab:
             store.delete_slot(gone)
             st.rerun()
 
+    st.divider()
+    st.subheader("Who is checked in right now")
+    st.caption("Entry ALLOW = check-in at that lab; the kiosk's 'Check out' button = check-out. While someone "
+               "is checked in, an entry attempt at a DIFFERENT lab is denied and flagged. Check-ins expire "
+               f"{config.PRESENCE_GRACE_MINUTES} min after the person's slot ends "
+               f"(or after {config.PRESENCE_MAX_HOURS} h without a slot).")
+    here = presence.present()
+    if here:
+        st.dataframe([{"Person": p_["person_id"], "Checked in at": p_["location"], "Since": p_["since"],
+                       "Auto check-out": p_["expires"]} for p_ in here], width="stretch")
+        who_out = st.selectbox("Force check-out (e.g. forgot to check out)", [p_["person_id"] for p_ in here],
+                               key="force_out")
+        if st.button("Force check-out"):
+            presence.force_checkout(who_out)
+            store.log_event({"verdict": "CHECKED_OUT", "person_id": who_out, "mode": "override",
+                             "reasons": ["Forced check-out by admin."], "direction": "out"})
+            st.success(f"{who_out} checked out.")
+            st.rerun()
+    else:
+        st.info("Nobody is checked in.")
+
 # ======================================================== Offline mode
 with offline_tab:
     online_now = offline.is_online(force=True)
@@ -144,9 +190,19 @@ with offline_tab:
     sim = st.toggle("Simulate network loss (demo)", value=offline.is_simulated_offline())
     if sim != offline.is_simulated_offline():
         offline.set_simulated_offline(sim)
+        try:   # flip the kiosk server too, so the kiosk switches to offline mode automatically
+            import json as _json
+            import urllib.request
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{config.SERVER_PORT}/api/offline/simulate",
+                data=_json.dumps({"offline": sim}).encode(), method="POST",
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=2).read()
+        except Exception:
+            st.warning("Kiosk server not reachable: use the switch on the kiosk page instead.")
         st.rerun()
-    st.caption("Note: the kiosk server (python server.py) has its own switch: "
-               "POST /api/offline/simulate, or stop the Wi-Fi to test for real.")
+    st.caption("This switch also flips the kiosk (python server.py). The kiosk page switches "
+               "to the offline face check within 5 seconds. You can also simply turn off Wi-Fi.")
     if st.button("Sync now"):
         st.success(f"Synced {offline.sync()} decision(s) to the central log.")
     st.subheader("Set up a person's offline code")
@@ -172,7 +228,7 @@ with perf_tab:
     st.write("On the kiosk page (localhost:8000), pick a **🧪 Test mode** label at the bottom "
              "(genuine, printed photo, screen photo, video replay, mask, impostor), then do the "
              "attempt. Every labelled attempt is measured here.")
-    live_rep = evaluate.live_kiosk_report(store.recent_events(2000))
+    live_rep = evaluate.live_kiosk_report([e for e in store.recent_events(2000) if e.get("mode") != "offline"])
     if not live_rep:
         st.info("No labelled kiosk attempts yet.")
     else:
@@ -194,7 +250,33 @@ with perf_tab:
                 st.write(genai.summarize_performance(live_rep))
 
     st.divider()
-    st.subheader("2. Image test set (backup photo checks + identity)")
+    st.subheader("2. Offline mode results (on-device OpenCV YuNet + SFace + random actions)")
+    st.write("Tick **Simulate AWS outage** on the kiosk, choose a **🧪 Test mode** label, then do the "
+             "offline face check. Each labelled offline attempt is measured here (no photos stored).")
+    off_rep = evaluate.offline_report()
+    if not off_rep:
+        st.info("No labelled offline attempts yet.")
+    else:
+        o = off_rep["overall"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Liveness (spoof) detection accuracy", f"{o['liveness_accuracy_pct']}%")
+        c2.metric("Face authentication accuracy", f"{o['face_auth_accuracy_pct']}%")
+        c3.metric("False acceptance rate (FAR)", f"{o['false_accept_rate_pct']}%")
+        c4.metric("False rejection rate (FRR)", f"{o['false_reject_rate_pct']}%")
+        st.caption(f"{off_rep['attempts']} labelled offline attempts · avg processing after the last "
+                   f"action {o['avg_decision_ms']} ms. A STEP-UP (6-digit code) is not counted as an accept.")
+        st.dataframe([{"scenario": k, **{kk: vv for kk, vv in v.items() if kk != "avg_liveness_conf"}}
+                      for k, v in off_rep["per_scenario"].items()], width="stretch")
+        c7, c8 = st.columns(2)
+        if c7.button("AI summary for judges (offline)"):
+            with st.spinner("Summarising..."):
+                st.write(genai.summarize_performance(off_rep))
+        if c8.button("Clear offline test results"):
+            evaluate.clear_offline_tests()
+            st.rerun()
+
+    st.divider()
+    st.subheader("3. Image test set (backup photo checks + identity)")
     st.caption("Test images are personal data: consented team members only; delete the "
                "test_data folder after the event.")
     counts = evaluate.count_images()
@@ -290,6 +372,7 @@ with admin_tab:
                 st.success(f"{who} is now {new_status}.")
             if c2.button("Delete face data"):
                 n = aws_call(face_service.remove_person, who, default=0)
+                local_face.remove_vector(who)
                 store.delete_person(who)
                 st.success(f"Deleted {n} face sample(s) for {who}.")
     with right:
@@ -303,6 +386,9 @@ with admin_tab:
     events = store.recent_events(100)
     st.dataframe([{
         "time": e.get("time"), "verdict": e.get("verdict"), "person": e.get("person_id"),
+        "lab": e.get("location"),
+        "action": ("check-out" if e.get("direction") == "out" else "check-in")
+                  if e.get("verdict") == "ALLOW" else (e.get("flag") or ""),
         "similarity": e.get("similarity"),
         "liveness": (e.get("liveness") or {}).get("score"),
         "spoof_type": (e.get("liveness") or {}).get("spoof_type"),

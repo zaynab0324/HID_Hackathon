@@ -17,6 +17,8 @@ CONTRACT:
     has_code(person_id) -> bool
     verify_code(person_id, code) -> bool
     offline_decide(person_id, code, location, now, faces_in_view) -> AccessResult-like dict
+    offline_face_decide(face_check, code, location, now) -> AccessResult-like dict
+        face_check = local_face.verify(...) : offline face match + random-action liveness
     queue_decision(event) -> dict
     pending() -> list[dict]
     sync() -> int                                # number of decisions synced
@@ -152,7 +154,96 @@ def offline_decide(person_id, code, location, now, faces_in_view):
     if schedule["status"] != "in_schedule":
         return done("DENY", [schedule["reason"], "Offline, only scheduled access is allowed. "
                                                  "Please see the guard."])
+    import presence
+    inside = presence.current(person_id, now)
+    if inside and inside["location"] != location:
+        return done("DENY", [f"Checked in at {inside['location']} and not checked out."])
+    presence.check_in(person_id, location, now, schedule)
     return done("ALLOW", ["Authenticator code verified.", schedule["reason"]])
+
+
+# ------------------------------------------------------------ offline face + random action
+
+def offline_face_decide(face_check, code, location, now):
+    """Local OpenCV face match + random-action liveness. Fails safe:
+    ALLOW only if live AND strong match AND active AND in schedule AND no impossible travel.
+    Weak match or near-schedule -> REQUEST_VERIFICATION (6-digit code). Anything else -> DENY."""
+    import local_face
+    import security
+    start = time.perf_counter()
+    reasons = ["OFFLINE MODE: cloud unreachable, using the local face model + random-action liveness."]
+    method = "offline_face+challenge"
+    pid = face_check.get("person_id")
+    cos = face_check.get("cosine")
+    live = face_check.get("live")
+    for a in face_check.get("actions", []):
+        reasons.append(f"Action '{a['label']}': {'done' if a['done'] else 'NOT done'}.")
+    liveness = {"live": live, "score": 1.0 if live else 0.0,
+                "spoof_type": face_check.get("spoof_type") if live is False else None,
+                "signals": {"actions": face_check.get("actions", [])},
+                "source": "offline_challenge", "reasons": [face_check.get("reason", "")]}
+
+    def done(verdict, why, verification=None, schedule=None, queue=True, flag=None):
+        result = {
+            "verdict": verdict, "verification": verification, "reasons": reasons + why,
+            "person_id": pid,
+            "similarity": round(cos * 100, 1) if cos is not None else None,
+            "mode": "offline", "method": method, "location": location, "liveness": liveness,
+            "schedule": schedule, "flag": flag,
+            "decision_ms": int((time.perf_counter() - start) * 1000),
+            "challenge": None, "explanation": f"{verdict}: " + " ".join(why),
+        }
+        if queue:
+            queue_decision(result)
+        if flag:   # alert locally even while offline
+            security.raise_alert(flag, " ".join(result["reasons"]), result)
+        return result
+
+    if live is None:
+        return done("RETRY", [face_check.get("reason", "Please try again.")], queue=False)
+    if live is False:
+        return done("DENY", [f"Spoof suspected: {face_check.get('reason', '')}"])
+    if not pid or cos is None or cos < local_face.REVIEW_COSINE:
+        pid = None
+        return done("DENY", ["Face not recognised by the offline model. Please see the guard."])
+    person = store.get_person(pid)
+    if not person:
+        return done("DENY", ["Unknown person. Please see the guard."])
+    if person.get("status") == "suspended":
+        return done("DENY", ["Access is suspended."])
+    import presence
+    inside = presence.current(pid, now)
+    if inside and inside["location"] != location:
+        return done("DENY", [f"{pid} is checked in at {inside['location']} since {inside['since'][11:16]} "
+                             "and has not checked out: possible cloned identity."], flag="already_checked_in")
+    last = security.last_allow(pid, now)
+    if last and last["location"] != location and last["minutes_ago"] < config.IMPOSSIBLE_TRAVEL_MINUTES:
+        what = "checked out of" if last.get("direction") == "out" else "allowed at"
+        return done("DENY", [f"Impossible travel: {what} {last['location']} only "
+                             f"{last['minutes_ago']:.1f} min ago (minimum {config.IMPOSSIBLE_TRAVEL_MINUTES} min "
+                             "between labs)."], flag="impossible_travel")
+    schedule = store.check_schedule(pid, location, now)
+    if schedule["status"] == "out_of_schedule":
+        return done("DENY", [schedule["reason"], "Offline, only scheduled access is allowed."],
+                    schedule=schedule)
+    weak = cos < local_face.MATCH_COSINE
+    near = schedule["status"] != "in_schedule"
+    if weak or near:
+        why = (["Offline face match is not strong enough."] if weak else []) + \
+              ([schedule["reason"]] if near else [])
+        if code and verify_code(pid, code):
+            method = "offline_face+challenge+totp"
+            rec = presence.check_in(pid, location, now, schedule)
+            return {**done("ALLOW", why + ["Authenticator code verified."], schedule=schedule),
+                    "presence": rec, "direction": "in"}
+        if code:
+            return done("DENY", why + ["Wrong or expired authenticator code."], schedule=schedule)
+        return done("REQUEST_VERIFICATION", why + ["Enter your 6-digit authenticator code."],
+                    verification="code", schedule=schedule, queue=False)
+    rec = presence.check_in(pid, location, now, schedule)
+    return {**done("ALLOW", [f"Live face (random actions passed), offline match {pid} "
+                             f"({cos * 100:.1f}%).", schedule["reason"]], schedule=schedule),
+            "presence": rec, "direction": "in"}
 
 
 # ------------------------------------------------------------ queue + sync

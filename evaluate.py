@@ -172,8 +172,49 @@ def run_evaluation(test_dir=None):
 LIVE_ATTACKS = {"printed_photo", "screen_photo", "video_replay", "mask"}
 
 
-def live_kiosk_report(events):
-    """Metrics from REAL kiosk attempts (AWS Face Liveness), labelled with the kiosk's test mode."""
+OFFLINE_TESTS_FILE = os.path.join(config.DATA_DIR, "offline_tests.json")
+
+
+def record_offline_test(result):
+    """Staff test attempts in OFFLINE mode (kiosk test mode label) -> local evaluation file.
+    Only the fields needed for metrics: no photos, no vectors."""
+    keep = ("time", "test_label", "verdict", "person_id", "similarity", "decision_ms", "location", "mode")
+    item = {k: result.get(k) for k in keep}
+    item["time"] = item["time"] or __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    live = result.get("liveness") or {}
+    item["liveness"] = {"live": live.get("live"), "spoof_type": live.get("spoof_type")}
+    item["frame_ms"] = (result.get("timing") or {}).get("avg_frame_ms")
+    items = load_offline_tests()
+    items.append(item)
+    os.makedirs(os.path.dirname(OFFLINE_TESTS_FILE) or ".", exist_ok=True)
+    with open(OFFLINE_TESTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(items[-2000:], f, indent=1)
+    return item
+
+
+def load_offline_tests():
+    try:
+        with open(OFFLINE_TESTS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def clear_offline_tests():
+    if os.path.exists(OFFLINE_TESTS_FILE):
+        os.remove(OFFLINE_TESTS_FILE)
+
+
+def offline_report():
+    """Same 4 metrics for the on-device model (OpenCV YuNet + SFace + random actions)."""
+    import local_face
+    return live_kiosk_report(load_offline_tests(), match_pct=local_face.MATCH_COSINE * 100)
+
+
+def live_kiosk_report(events, match_pct=None):
+    """Metrics from REAL kiosk attempts (AWS Face Liveness), labelled with the kiosk's test mode.
+    match_pct: similarity needed to count as a correct match (offline uses the SFace threshold)."""
+    match_pct = config.MATCH_THRESHOLD if match_pct is None else match_pct
     tests = [e for e in events if e.get("test_label")]
     if not tests:
         return None
@@ -183,6 +224,10 @@ def live_kiosk_report(events):
 
     def live_flag(e):
         return (e.get("liveness") or {}).get("live")
+
+    def biometric_pass(e):
+        return (live_flag(e) is True and e.get("person_id") is not None
+                and (e.get("similarity") or 0) >= match_pct)
 
     times = [e["decision_ms"] for e in tests if isinstance(e.get("decision_ms"), (int, float))]
     per = {}
@@ -207,11 +252,13 @@ def live_kiosk_report(events):
         "overall": {
             "liveness_accuracy_pct": _pct(live_correct, len(genuine) + len(attacks)),
             "face_auth_accuracy_pct": _pct(sum(e.get("person_id") is not None and
-                                               (e.get("similarity") or 0) >= config.MATCH_THRESHOLD
+                                               (e.get("similarity") or 0) >= match_pct
                                                for e in genuine), len(genuine)),
-            "false_accept_rate_pct": _pct(sum(e["verdict"] == "ALLOW" for e in attacks + impostors),
+            # biometric FAR/FRR: did liveness + face match accept / reject the person?
+            # (schedule decisions are policy, not biometric errors, so they are not counted here)
+            "false_accept_rate_pct": _pct(sum(biometric_pass(e) for e in attacks + impostors),
                                           len(attacks) + len(impostors)),
-            "false_reject_rate_pct": _pct(sum(e["verdict"] == "DENY" for e in genuine), len(genuine)),
+            "false_reject_rate_pct": _pct(sum(not biometric_pass(e) for e in genuine), len(genuine)),
             "avg_decision_ms": int(statistics.mean(times)) if times else None,
             "under_2s_pct": _pct(sum(t <= config.DECISION_BUDGET_MS for t in times), len(times)),
         },

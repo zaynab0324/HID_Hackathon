@@ -28,6 +28,8 @@ import store  # noqa: E402
 
 import offline  # noqa: E402
 import security  # noqa: E402
+import local_face  # noqa: E402
+import presence  # noqa: E402
 
 config.REQUIRE_ACTIVE_CHECK = False   # most tests check the passive rules; security mode tested below
 config.USE_GENAI_INSPECTOR = False    # tested separately below with a fake inspector
@@ -37,11 +39,14 @@ store.LOG_FILE = os.path.join(config.DATA_DIR, "access_log.json")
 offline.SECRETS_FILE = os.path.join(config.DATA_DIR, "offline_secrets.json")
 offline.QUEUE_FILE = os.path.join(config.DATA_DIR, "offline_queue.json")
 security.ALERTS_FILE = os.path.join(config.DATA_DIR, "alerts.json")
+local_face.VECTORS_FILE = os.path.join(config.DATA_DIR, "offline_faces.json")
+presence.PRESENCE_FILE = os.path.join(config.DATA_DIR, "presence.json")
 security.RESET_FILE = os.path.join(config.DATA_DIR, "threat_reset.txt")
 REAL_THREAT = security.threat_status
 NO_THREAT = {"active": False, "spoof_attempts": 0, "until": None, "targeted_ids": [], "reason": ""}
 security.threat_status = lambda now=None: NO_THREAT   # threat mode is tested on its own below
 evaluate.REPORT_FILE = os.path.join(config.DATA_DIR, "eval_report.json")
+evaluate.OFFLINE_TESTS_FILE = os.path.join(config.DATA_DIR, "offline_tests.json")
 evaluate.DETAILS_FILE = os.path.join(config.DATA_DIR, "eval_details.csv")
 
 # A real JPEG so the image-texture code runs for real.
@@ -443,14 +448,55 @@ try:
         r1 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 3")
         check("first door -> ALLOW", r1["verdict"] == "ALLOW")
         r2 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Hostel A")
-        check("other door 0 min later -> DENY impossible travel",
-              r2["verdict"] == "DENY" and r2["flag"] == "impossible_travel")
-        check("impossible travel raises alert", security.alerts()[0]["kind"] == "impossible_travel")
+        check("other door 0 min later (still checked in) -> DENY",
+              r2["verdict"] == "DENY" and r2["flag"] == "already_checked_in")
+        check("two-places attempt raises alert", security.alerts()[0]["kind"] == "already_checked_in")
         r3 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 3")
         check("same door again is fine", r3["verdict"] == "ALLOW")
         later = datetime.now() + timedelta(minutes=config.IMPOSSIBLE_TRAVEL_MINUTES + 1)
         r4 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Hostel A", now=later)
-        check("other door after the travel window -> ALLOW", r4["verdict"] == "ALLOW")
+        check("still checked in at Lab 3 -> other lab DENY", r4["verdict"] == "DENY"
+              and r4["flag"] == "already_checked_in")
+        check("already-checked-in raises alert", security.alerts()[0]["kind"] == "already_checked_in")
+        check("presence shows Lab 3", presence.current("ravi", later)["location"] == "Lab 3")
+        out = pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 3", now=later,
+                                      direction="out")
+        check("check-out at Lab 3 -> ALLOW + checked out", out["verdict"] == "ALLOW" and out["direction"] == "out"
+              and presence.current("ravi", later) is None)
+        too_soon = pipeline.check_official(strong_live, IMG, use_ai=False, location="Hostel A",
+                                           now=later + timedelta(minutes=1))
+        check("other lab 1 min after check-out -> DENY impossible travel", too_soon["verdict"] == "DENY"
+              and too_soon["flag"] == "impossible_travel" and "checked out of" in too_soon["reasons"][0])
+        same_lab = pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 3",
+                                           now=later + timedelta(minutes=1, seconds=5))
+        check("same lab right after check-out -> ALLOW", same_lab["verdict"] == "ALLOW")
+        pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 3",
+                                now=later + timedelta(minutes=1, seconds=10), direction="out")
+        t5 = later + timedelta(minutes=1, seconds=10) + timedelta(minutes=config.IMPOSSIBLE_TRAVEL_MINUTES, seconds=5)
+        r5 = pipeline.check_official(strong_live, IMG, use_ai=False, location="Hostel A", now=t5)
+        check("other lab after walking time -> ALLOW", r5["verdict"] == "ALLOW"
+              and presence.current("ravi", t5)["location"] == "Hostel A")
+        mism = pipeline.check_official(strong_live, IMG, use_ai=False, location="Library",
+                                       now=t5 + timedelta(minutes=1), direction="out")
+        check("check-out at the wrong lab -> allowed out but flagged", mism["verdict"] == "ALLOW"
+              and mism["flag"] == "checkout_mismatch" and security.alerts()[0]["kind"] == "checkout_mismatch")
+        spoof_out = pipeline.check_official({**strong_live, "live": False, "spoof_type": "presentation_attack"},
+                                            IMG, use_ai=False, location="Lab 3", direction="out")
+        check("spoof cannot check someone out", spoof_out["verdict"] == "DENY")
+        store.upsert_person("sus", status="suspended", role="student")
+        presence.check_in("sus", "Lab 5", datetime.now())
+        scene(pid="sus")
+        check("suspended person can still check out (never trapped)",
+              pipeline.check_official(strong_live, IMG, use_ai=False, location="Lab 5",
+                                      direction="out")["verdict"] == "ALLOW"
+              and presence.current("sus") is None)
+        scene(pid="ravi")
+        old = datetime.now() - timedelta(hours=config.PRESENCE_MAX_HOURS + 1)
+        presence.check_in("old_person", "Lab 3", old)
+        check("forgotten check-in expires automatically", presence.current("old_person") is None)
+        presence.check_in("forced", "Lab 3")
+        check("admin force check-out", presence.force_checkout("forced") and presence.current("forced") is None)
+        presence.force_checkout("ravi")
 
         # ---------- security: liveness-verified enrollment ----------
         real_get2, real_identify, real_enroll = official_liveness.get_result, face_service.identify, face_service.enroll
@@ -483,6 +529,24 @@ try:
         res = client.post("/api/enroll", json={**body, "person_id": "Fake Name", "session_id": fresh_session()}).json()
         check("someone else's face under a new name refused", res["ok"] is False and "already enrolled as afrah" in res["message"])
         check("duplicate enrollment raises alert", security.alerts()[0]["kind"] == "duplicate_enrollment")
+        # ---------- save offline vector for an already-enrolled person ----------
+        real_save = local_face.save_vector
+        local_face.save_vector = lambda pid, img: True
+        tok = security.issue_enroll_token("afrah", "student", "active", kind="offline_vector")
+        check("vector link shows its purpose", client.get(f"/api/enroll_token/{tok}").json()["kind"] == "offline_vector")
+        res = client.post("/api/enroll", json={"session_id": fresh_session(), "token": tok}).json()
+        check("offline vector saved when live + same enrolled face", res["ok"] and store.get_person("afrah")["offline_vector"])
+        tok = security.issue_enroll_token("riya", "student", "active", kind="offline_vector")
+        res = client.post("/api/enroll", json={"session_id": fresh_session(), "token": tok}).json()
+        check("offline vector refused for a different face", res["ok"] is False
+              and security.alerts()[0]["kind"] == "offline_vector_mismatch")
+        official_liveness.get_result = lambda s_: ({"live": False, "score": 0.1, "spoof_type": "presentation_attack",
+                                                     "signals": {"aws_confidence": 12.0}, "source": "aws_face_liveness",
+                                                     "reasons": []}, IMG)
+        tok = security.issue_enroll_token("afrah", "student", "active", kind="offline_vector")
+        check("offline vector refused for a photo",
+              client.post("/api/enroll", json={"session_id": fresh_session(), "token": tok}).json()["ok"] is False)
+        local_face.save_vector = real_save
         official_liveness.get_result, face_service.identify, face_service.enroll = real_get2, real_identify, real_enroll
 
         # ---------- security: tamper-evident log ----------
@@ -528,6 +592,183 @@ try:
         check("eval report saved", evaluate.load_report()["total_images"] == 6)
         check("eval judges' metrics present", {"liveness_accuracy_pct", "face_auth_accuracy_pct", "apcer_pct",
                                                "bpcer_pct", "false_accept_rate_pct", "false_reject_rate_pct"} <= set(o))
+
+        # ---------- Challenge 2: offline face model + random-action liveness ----------
+        import base64 as _b64
+        v_riya = np.zeros(128)
+        v_riya[0] = 1.0
+        v_weak = np.zeros(128)
+        v_weak[0], v_weak[1] = 0.40, (1 - 0.16) ** 0.5
+        v_other = np.zeros(128)
+        v_other[5] = 1.0
+        G = {"straight": {"yaw": 0.0, "size": 0.30, "eye_open": 0.50},
+             "left": {"yaw": 0.25, "size": 0.30, "eye_open": 0.50},
+             "right": {"yaw": -0.25, "size": 0.30, "eye_open": 0.50},
+             "closed": {"yaw": 0.0, "size": 0.30, "eye_open": 0.20},     # eyes shut (blink)
+             "closer": {"yaw": 0.0, "size": 0.40, "eye_open": 0.50}}
+
+        def fake_analyse(image_bytes, with_vector=True):
+            tag = image_bytes.decode()
+            if tag.startswith("none"):
+                return {"faces": 0, "geometry": None, "vector": None, "box": None}
+            if tag.startswith("two"):
+                return {"faces": 2, "geometry": None, "vector": None, "box": None}
+            pose, who = tag.split(":")
+            vec = {"riya": v_riya, "weak": v_weak, "other": v_other}[who]
+            return {"faces": 1, "geometry": dict(G[pose]), "vector": vec, "box": [0.3, 0.2, 0.4, 0.5]}
+
+        real_analyse = local_face.analyse
+        local_face.analyse = fake_analyse
+        local_face._save({"riya": list(v_riya)})
+        real_avail = local_face.available
+        local_face.available = lambda: True
+
+        def challenge(actions):
+            ch = local_face.new_challenge()
+            local_face._challenges[ch["id"]]["actions"] = actions
+            return ch["id"]
+
+        def frames(base, a0, a1, who="riya", who1=None):
+            out = [{"phase": "baseline", "image": f"{base}:{who}".encode()} for _ in range(3)]
+            out += [{"phase": 0, "image": f"{a0}:{who}".encode()} for _ in range(3)]
+            seq1 = ["closed", "closed", "straight"] if a1 == "blink" else [a1] * 3
+            out += [{"phase": 1, "image": f"{p_}:{who1 or who}".encode()} for p_ in seq1]
+            return out
+
+        ch = local_face.new_challenge()
+        check("offline challenge: 2 actions, at least one head turn", len(ch["actions"]) == 2
+              and any(a in local_face.THREE_D_ACTIONS for a in ch["actions"]))
+        check("offline challenge: no smile, blink possible", all("smile" not in local_face.new_challenge()["actions"]
+                                                                  for _ in range(30))
+              and any("blink" in local_face.new_challenge()["actions"] for _ in range(60)))
+        cid = challenge(["turn_left", "blink"])
+        fc = local_face.verify(cid, frames("straight", "left", "blink"))
+        check("offline face: live person doing both actions", fc["live"] is True and fc["person_id"] == "riya")
+        r = offline.offline_face_decide(fc, None, "Lab 3", monday_10)
+        check("offline face: live + match + schedule -> ALLOW", r["verdict"] == "ALLOW" and r["mode"] == "offline")
+        check("offline face: challenge is single use", local_face.verify(cid, frames("straight", "left", "blink"))["live"] is False)
+        fc = local_face.verify(challenge(["turn_right", "move_closer"]), frames("straight", "straight", "straight"))
+        r = offline.offline_face_decide(fc, None, "Lab 3", monday_10)
+        check("offline face: photo (no movement) -> DENY", r["verdict"] == "DENY" and fc["spoof_type"] == "failed_challenge")
+        fc = local_face.verify(challenge(["turn_left", "blink"]), frames("straight", "right", "blink"))
+        check("offline face: wrong direction (replayed video) -> spoof", fc["live"] is False)
+        fc = local_face.verify(challenge(["turn_left", "blink"]), frames("straight", "left", "straight"))
+        check("offline face: no blink (photo) -> spoof", fc["live"] is False)
+        p_, fc = None, None
+        fc = local_face.verify(challenge(["turn_left", "blink"]), frames("straight", "left", "blink", who1="other"))
+        check("offline face: face swapped mid-check -> spoof", fc["live"] is False and fc["spoof_type"] == "face_swap")
+        two = frames("straight", "left", "blink")
+        two[4]["image"] = b"two"
+        check("offline face: two faces -> spoof", local_face.verify(challenge(["turn_left", "blink"]), two)["live"] is False)
+        fc = local_face.verify(challenge(["turn_left", "blink"]), frames("none", "none", "none"))
+        check("offline face: no face -> RETRY", offline.offline_face_decide(fc, None, "Lab 3", monday_10)["verdict"] == "RETRY")
+        fc = local_face.verify(challenge(["move_closer", "blink"]), frames("straight", "closer", "blink", who="other"))
+        check("offline face: live but unknown -> DENY",
+              offline.offline_face_decide(fc, None, "Lab 3", monday_10)["verdict"] == "DENY")
+        fc = local_face.verify(challenge(["turn_left", "blink"]), frames("straight", "left", "blink"))
+        check("offline face: out of schedule -> DENY",
+              offline.offline_face_decide(fc, None, "Lab 3", monday_10.replace(hour=15))["verdict"] == "DENY")
+        presence.check_in("riya", "Library", monday_10)
+        fc = local_face.verify(challenge(["turn_left", "blink"]), frames("straight", "left", "blink"))
+        r = offline.offline_face_decide(fc, None, "Lab 3", monday_10)
+        check("offline: checked in at another lab -> DENY", r["verdict"] == "DENY" and r["flag"] == "already_checked_in")
+        presence.force_checkout("riya")
+        fc = local_face.verify(challenge(["turn_left", "blink"]), frames("straight", "left", "blink", who="weak"))
+        r = offline.offline_face_decide(fc, None, "Lab 3", monday_10)
+        check("offline face: weak match -> step-up code", r["verdict"] == "REQUEST_VERIFICATION" and r["verification"] == "code")
+        r = offline.offline_face_decide(fc, pyotp.TOTP(secret).now(), "Lab 3", monday_10)
+        check("offline face: weak match + valid code -> ALLOW", r["verdict"] == "ALLOW")
+        check("offline face: queue has no photos", all("image" not in q and "frames" not in q for q in offline.pending()))
+
+        # live mode: frame by frame with feedback
+        def live_run(actions, poses, who="riya"):
+            cid = challenge(actions)
+            p = None
+            for pose in poses:
+                tag = pose if ":" in pose else f"{pose}:{who}"
+                p = local_face.process_frame(cid, tag.encode())
+                if p["done"]:
+                    break
+            return p, local_face.finish(cid)
+
+        p, fc = live_run(["turn_left", "blink"], ["straight"] * 3 + ["left"] * 2 + ["closed", "straight"])
+        check("live offline: steps advance and finish", p["done"] and all(s_["done"] for s_ in p["steps"]))
+        check("live offline: real person -> live + match", fc["live"] is True and fc["person_id"] == "riya")
+        check("live offline: ALLOW", offline.offline_face_decide(fc, None, "Lab 3", monday_10)["verdict"] == "ALLOW")
+        p, fc = live_run(["turn_left", "blink"], ["straight"] * 3 + ["straight"] * 4)
+        check("live offline: photo not finished -> not live", fc["live"] is False)
+        p, fc = live_run(["turn_left", "blink"], ["straight"] * 3 + ["left"] * 2 + ["closed:other"])
+        check("live offline: face swap -> spoof", fc["live"] is False and fc["spoof_type"] == "face_swap")
+        p, fc = live_run(["turn_left", "blink"], ["straight", "two"])
+        check("live offline: two faces -> spoof", fc["live"] is False and p["failed"])
+        p, fc = live_run(["turn_left", "blink"], ["none"] * 3)
+        check("live offline: no face yet -> keeps waiting", p["done"] is False and p["faces"] == 0 and fc["live"] is None)
+        check("live offline: finish is single use", local_face.finish(cid)["live"] is False)
+        check("live offline: preview detect", local_face.detect(b"straight:riya")["faces"] == 1)
+
+        def b64(fr):
+            return [{"phase": f["phase"], "image": "data:image/jpeg;base64," + _b64.b64encode(f["image"]).decode()} for f in fr]
+
+        offline.is_online = lambda force=False: False
+        check("api status: offline face ready", client.get("/api/status").json()["offline_face_ready"] is True)
+        ch = client.post("/api/offline/challenge", json={}).json()
+        local_face._challenges[ch["challenge_id"]]["actions"] = ["turn_left", "blink"]
+        r = client.post("/api/offline/face", json={"challenge_id": ch["challenge_id"],
+                                                   "frames": b64(frames("straight", "left", "blink")),
+                                                   "location": "Lab 3"}).json()
+        check("api offline face: returns a decision", r["verdict"] in ("ALLOW", "DENY") and r["mode"] == "offline"
+              and r["liveness"]["live"] is True)
+        ch = client.post("/api/offline/challenge", json={}).json()
+        local_face._challenges[ch["challenge_id"]]["actions"] = ["turn_left", "blink"]
+        r = client.post("/api/offline/face", json={"challenge_id": ch["challenge_id"],
+                                                   "frames": b64(frames("straight", "left", "blink", who="weak")),
+                                                   "location": "Lab 3"}).json()
+        if r["verdict"] == "REQUEST_VERIFICATION":
+            r2 = client.post("/api/offline/stepup", json={"ticket": r["stepup_ticket"], "code": "000000"})
+            check("api offline step-up: ticket works once", r2.status_code == 200 and
+                  client.post("/api/offline/stepup", json={"ticket": r["stepup_ticket"], "code": "000000"}).status_code == 400)
+        else:
+            check("api offline weak match never ALLOWs without a code", r["verdict"] != "ALLOW")
+        ch = client.post("/api/offline/challenge", json={}).json()
+        local_face._challenges[ch["challenge_id"]]["actions"] = ["turn_left", "blink"]
+        for pose in ["straight"] * 3 + ["left"] * 2 + ["closed", "straight"]:
+            pr = client.post("/api/offline/frame", json={"challenge_id": ch["challenge_id"],
+                                                         "image": _b64.b64encode(f"{pose}:riya".encode()).decode()}).json()
+        r = client.post("/api/offline/finish", json={"challenge_id": ch["challenge_id"], "location": "Lab 3"}).json()
+        check("api live offline: frame -> finish gives a decision", pr["done"] and r["mode"] == "offline"
+              and r["liveness"]["live"] is True)
+        # offline metrics from labelled offline attempts
+        evaluate.clear_offline_tests()
+
+        def offline_attempt(label, poses, who="riya"):
+            ch_ = client.post("/api/offline/challenge", json={}).json()
+            local_face._challenges[ch_["challenge_id"]]["actions"] = ["turn_left", "blink"]
+            for pose in poses:
+                client.post("/api/offline/frame", json={"challenge_id": ch_["challenge_id"],
+                                                        "image": _b64.b64encode(f"{pose}:{who}".encode()).decode()})
+            return client.post("/api/offline/finish", json={"challenge_id": ch_["challenge_id"], "location": "Lab 3",
+                                                            "test_label": label}).json()
+
+        good = ["straight"] * 3 + ["left"] * 2 + ["closed", "straight"]
+        offline_attempt("genuine", good)
+        offline_attempt("printed_photo", ["straight"] * 3 + ["straight"] * 3)
+        offline_attempt("impostor", good, who="other")
+        rep = evaluate.offline_report()
+        check("offline metrics: attempts recorded", rep and rep["attempts"] == 3)
+        check("offline metrics: photo detected, impostor not accepted",
+              rep["overall"]["false_accept_rate_pct"] == 0.0 and rep["per_scenario"]["printed_photo"]["DENY"] == 1)
+        check("offline metrics: liveness accuracy", rep["overall"]["liveness_accuracy_pct"] == 100.0)
+        check("offline metrics in /api/status", client.get("/api/status").json()["offline_metrics"]["attempts"] == 3)
+        check("offline test records hold no images", all("image" not in t and "vector" not in t
+                                                          for t in evaluate.load_offline_tests()))
+        check("api offline detect", client.post("/api/offline/detect", json={
+            "image": _b64.b64encode(b"straight:riya").decode()}).json()["faces"] == 1)
+        offline.is_online = real_online
+        local_face.analyse = real_analyse
+        local_face.available = real_avail
+        if local_face.available():
+            check("real OpenCV models run (random image -> no face)", local_face.analyse(IMG)["faces"] == 0)
+            check("enrollment saves no vector without a face", local_face.save_vector("x", IMG) is False)
 
         rek_stub.assert_no_pending_responses()
         br_stub.assert_no_pending_responses()

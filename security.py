@@ -11,7 +11,7 @@ CONTRACT:
     alerts(limit=50) -> list[dict]
     reset_threat() -> None                             # a guard confirms the threat is handled
     last_allow(person_id, now=None) -> {"location": str, "minutes_ago": float} | None
-    issue_enroll_token(person_id, role, status) -> str    # admin console: 5-min, single-use
+    issue_enroll_token(person_id, role, status, kind="enroll") -> str   # 5-min, single-use
     peek_enroll_token(token) -> dict | None
     consume_enroll_token(token) -> dict | None
 """
@@ -179,7 +179,7 @@ def _raise_alert(kind, message, event):
 def last_allow(person_id, now=None):
     now = now or datetime.now()
     for e in store.recent_events(300):
-        if e.get("person_id") != person_id or e.get("verdict") != "ALLOW" or not e.get("location"):
+        if e.get("person_id") != person_id:
             continue
         try:
             t = datetime.strptime(e["time"], "%Y-%m-%d %H:%M:%S")
@@ -187,7 +187,11 @@ def last_allow(person_id, now=None):
             continue
         if t > now:
             continue
-        return {"location": e["location"], "minutes_ago": (now - t).total_seconds() / 60}
+        if e.get("verdict") != "ALLOW" or not e.get("location"):
+            continue
+        # last place this person was SEEN: an entry or a check-out (they walk on from there)
+        return {"location": e["location"], "minutes_ago": (now - t).total_seconds() / 60,
+                "direction": e.get("direction") or "in"}
     return None
 
 
@@ -196,8 +200,8 @@ def raise_alert(kind, message, event):
 
 
 def on_decision(result):
-    if result.get("flag") == "impossible_travel":
-        _raise_alert("impossible_travel", " ".join(result.get("reasons", [])), result)
+    if result.get("flag") in ("impossible_travel", "already_checked_in", "checkout_mismatch"):
+        _raise_alert(result["flag"], " ".join(result.get("reasons", [])), result)
     if _is_spoof(result):
         kind = (result.get("liveness") or {}).get("spoof_type") or "presentation_attack"
         who = f" (looked like {result['person_id']})" if result.get("person_id") else ""
@@ -225,11 +229,12 @@ def _save_tokens(tokens):
         json.dump(tokens, f)
 
 
-def issue_enroll_token(person_id, role, status):
+def issue_enroll_token(person_id, role, status, kind="enroll"):
+    """kind: "enroll" (new person) | "offline_vector" (already enrolled: only add the offline vector)."""
     import secrets
     token = secrets.token_urlsafe(16)
     tokens = {k: v for k, v in _load_tokens().items() if v["expires"] > time.time()}
-    tokens[token] = {"person_id": person_id, "role": role, "status": status,
+    tokens[token] = {"person_id": person_id, "role": role, "status": status, "kind": kind,
                      "expires": time.time() + ENROLL_TOKEN_SECONDS}
     _save_tokens(tokens)
     return token
